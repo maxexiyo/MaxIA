@@ -12,6 +12,10 @@ import base64
 import io
 import discord
 import aiohttp
+import asyncio
+import time
+import threading
+from contextlib import asynccontextmanager
 from datetime import datetime
 from PIL import Image
 
@@ -28,6 +32,95 @@ from ia_core.config import GROQ_API_KEYS, GEMINI_API_KEYS  # noqa: F401 (usadas 
 
 
 class MotorIAMixin:
+    # ==========================================================================
+    # 🛠️ PARCHE DE RESILIENCIA DE RED
+    #  - UNA sesión HTTP compartida (antes se abría una nueva por cada intento: DNS + TLS cada vez).
+    #  - Timeouts explícitos + presupuesto de tiempo TOTAL por request (antes: hasta ~9 min).
+    #  - Si falla la RED (timeout / no conecta) NO se sigue rotando keys: no es culpa de la key.
+    #  - Cooldown para keys con 429 (se apartan un rato en vez de reintentarse en bucle).
+    #  - Prioridad: comandos/replies de usuarios = "alta"; modo ambiental y auto-aprendizaje = "baja"
+    #    (una sola a la vez, y se omiten si la red está caída) para no quitarle turno a un usuario.
+    # ==========================================================================
+    PRESUPUESTO_ALTA = 40        # seg máx. para una respuesta que pidió un usuario
+    PRESUPUESTO_BAJA = 20        # seg máx. para tareas de fondo (ambiental / auto-aprendizaje)
+    COOLDOWN_429 = 60            # seg que se aparta una key/modelo tras un 429
+    PAUSA_RED_CAIDA = 45         # seg que las tareas de fondo se saltan la IA tras una falla de red
+    ESPERA_BAJA = 8              # seg máx. que una tarea de fondo espera su turno antes de omitirse
+    MAX_FALLAS_RED_POR_REQUEST = 2
+    # Solo estos cuentan como "se cayó la red". Un reset de conexión vieja (ServerDisconnected,
+    # ConnectionReset) NO cuenta: simplemente se reintenta con la siguiente key.
+    ERRORES_RED = (asyncio.TimeoutError, aiohttp.ClientConnectorError, aiohttp.ServerTimeoutError)
+
+    def _res(self):
+        """Estado de resiliencia; se crea la primera vez que se usa (no hace falta tocar __init__)."""
+        st = getattr(self, "_res_state", None)
+        if st is None:
+            st = {
+                "http": None,
+                "cd": {},                      # (proveedor, pos_key, modelo) -> monotonic hasta cuando dura el cooldown
+                "red_mala_hasta": 0.0,
+                "sem_alta": asyncio.Semaphore(4),
+                "sem_baja": asyncio.Semaphore(1),
+            }
+            self._res_state = st
+        return st
+
+    def _get_http(self):
+        st = self._res()
+        if st["http"] is None or st["http"].closed:
+            st["http"] = aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(limit=20, ttl_dns_cache=300, keepalive_timeout=10),
+            )
+        return st["http"]
+
+    async def cerrar_http_ia(self):
+        """Llama esto en el cog_unload de tu cog (await self.cerrar_http_ia()) para cerrar la sesión compartida."""
+        st = self._res()
+        if st["http"] is not None and not st["http"].closed:
+            await st["http"].close()
+
+    @asynccontextmanager
+    async def _http_ctx(self):
+        yield self._get_http()
+
+    def _timeout(self, prioridad: str):
+        if prioridad == "baja":
+            return aiohttp.ClientTimeout(total=15, connect=6)
+        return aiohttp.ClientTimeout(total=25, connect=8)
+
+    def _sin_presupuesto(self, inicio: float, prioridad: str) -> bool:
+        limite = self.PRESUPUESTO_BAJA if prioridad == "baja" else self.PRESUPUESTO_ALTA
+        return (time.monotonic() - inicio) > limite
+
+    def _en_cooldown(self, proveedor: str, pos: int, modelo: str = "") -> bool:
+        return self._res()["cd"].get((proveedor, pos, modelo), 0.0) > time.monotonic()
+
+    def _poner_cooldown(self, proveedor: str, pos: int, modelo: str = "", segundos: float = None):
+        self._res()["cd"][(proveedor, pos, modelo)] = time.monotonic() + (segundos or self.COOLDOWN_429)
+
+    def _marcar_red(self, ok: bool):
+        self._res()["red_mala_hasta"] = 0.0 if ok else time.monotonic() + self.PAUSA_RED_CAIDA
+
+    def _red_en_pausa(self) -> bool:
+        """True si hace poco hubo fallas de red (las tareas de fondo se saltan la IA mientras tanto)."""
+        return self._res()["red_mala_hasta"] > time.monotonic()
+
+    async def _adquirir(self, prioridad: str):
+        """Regresa el semáforo ya adquirido, o None si la tarea de fondo debe omitirse."""
+        st = self._res()
+        if prioridad == "baja":
+            if self._red_en_pausa():
+                return None
+            sem = st["sem_baja"]
+            try:
+                await asyncio.wait_for(sem.acquire(), timeout=self.ESPERA_BAJA)
+            except asyncio.TimeoutError:
+                return None
+            return sem
+        sem = st["sem_alta"]
+        await sem.acquire()
+        return sem
+
     # --- REQUEST A GROQ (con rotación "pegajosa" de keys) ---
     def resolver_emoji_para_reaccion(self, emoji_texto: str, guild: discord.Guild = None):
         """Convierte lo que mandó la IA en algo que discord.Message.add_reaction pueda usar de verdad.
@@ -248,10 +341,23 @@ class MotorIAMixin:
 
         return tool_result or "Error"
 
-    async def request_groq(self, system_instruction: str, history: list, prompt: str, guild_id: int, channel_id: int,
+    async def request_groq(self, *args, prioridad: str = "alta", **kwargs) -> tuple:
+        """Misma firma de siempre + prioridad="alta"|"baja" (baja = modo ambiental / auto-aprendizaje)."""
+        sem = await self._adquirir(prioridad)
+        if sem is None:
+            print("⏭️ [Groq] request de baja prioridad omitida (red en pausa u otra tarea de fondo en curso)")
+            return None, None
+        try:
+            return await self._request_groq_impl(*args, prioridad=prioridad, **kwargs)
+        finally:
+            sem.release()
+
+    async def _request_groq_impl(self, system_instruction: str, history: list, prompt: str, guild_id: int, channel_id: int,
                             images: list = None, author_id: int = 0, author_name: str = "", usar_tools: bool = True,
-                            target_message: discord.Message = None) -> tuple:
+                            target_message: discord.Message = None, prioridad: str = "alta") -> tuple:
         if not images: images = []
+        inicio = time.monotonic()
+        fallas_red = 0
 
         num_keys = len(GROQ_API_KEYS)
         # ✅ Rotación pegajosa: empieza en la última key que funcionó, no siempre en la #1.
@@ -266,6 +372,11 @@ class MotorIAMixin:
         for pos in orden_intentos:
             groq_idx = pos + 1
             groq_key = GROQ_API_KEYS[pos]
+            if self._sin_presupuesto(inicio, prioridad):
+                print(f"⏱️ [Groq] Se acabó el presupuesto de tiempo ({prioridad}), corto sin seguir rotando keys.")
+                return None, None
+            if self._en_cooldown("groq", pos):
+                continue
             try:
                 url = "https://api.groq.com/openai/v1/chat/completions"
                 headers = {"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"}
@@ -294,7 +405,7 @@ class MotorIAMixin:
                 # ✅ Modelo dinámico: texto -> GPT-OSS 120B, imagen -> Qwen 3.6 (soporta visión)
                 # (llama-3.3-70b-versatile fue deprecado por Groq el 17/jun/2026)
                 usa_imagen = len(images) > 0
-                modelo = "qwen/qwen3.6-27b" if usa_imagen else "openai/gpt-oss-120b"
+                modelo = "qwen/qwen3.8-27b" if usa_imagen else "openai/gpt-oss-120b"
                 
                 payload = {
                     "model": modelo,
@@ -324,8 +435,9 @@ class MotorIAMixin:
                     payload["tools"] = TOOLS_DEFINITIONS
                     payload["tool_choice"] = "auto"
                 
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                async with self._http_ctx() as session:
+                    async with session.post(url, json=payload, headers=headers, timeout=self._timeout(prioridad)) as resp:
+                        self._marcar_red(True)
                         if resp.status == 200:
                             data = await resp.json()
                             response_message = data['choices'][0]['message']
@@ -364,11 +476,15 @@ class MotorIAMixin:
                                 # y si de plano ninguna responde, se manda una confirmación directa en vez de nada.
                                 final_response = None
                                 final_groq_idx = groq_idx
+                                inicio2 = time.monotonic()
                                 for pos2 in orden_intentos:
+                                    if self._sin_presupuesto(inicio2, prioridad):
+                                        print("⏱️ [Groq] Sin presupuesto de tiempo en la 2da llamada (tras tools), corto.")
+                                        break
                                     key2 = GROQ_API_KEYS[pos2]
                                     headers2 = {"Authorization": f"Bearer {key2}", "Content-Type": "application/json"}
                                     try:
-                                        async with session.post(url, json={**payload, "messages": messages}, headers=headers2, timeout=30) as resp2:
+                                        async with session.post(url, json={**payload, "messages": messages}, headers=headers2, timeout=self._timeout(prioridad)) as resp2:
                                             if resp2.status == 200:
                                                 data2 = await resp2.json()
                                                 final_response = data2['choices'][0]['message']['content']
@@ -379,7 +495,7 @@ class MotorIAMixin:
                                                 error_body2 = await resp2.text()
                                                 print(f"⚠️ Groq Key #{pos2 + 1} - (2da llamada, tras tools) Status {resp2.status} - Detalle: {error_body2[:300]}")
                                     except Exception as e2:
-                                        print(f"⚠️ Error Groq Key #{pos2 + 1} en 2da llamada (tras tools): {e2}")
+                                        print(f"⚠️ Error Groq Key #{pos2 + 1} en 2da llamada (tras tools): {type(e2).__name__}: {e2!r}")
 
                                 if final_response:
                                     texto_final = self.clean_ai_response(final_response)
@@ -403,7 +519,8 @@ class MotorIAMixin:
                                 self.groq_active_idx = pos  # ✅ se queda en esta key mientras funcione
                                 return self.clean_ai_response(response_message['content']), groq_idx
                         elif resp.status == 429:
-                            print(f"⚠️ Groq Key #{groq_idx} - Límite de tasa alcanzado. Rotando a la siguiente...")
+                            print(f"⚠️ Groq Key #{groq_idx} - Límite de tasa alcanzado. Rotando a la siguiente (y la aparto {self.COOLDOWN_429}s)...")
+                            self._poner_cooldown("groq", pos)
                             continue
                         else:
                             error_body = await resp.text()
@@ -414,16 +531,36 @@ class MotorIAMixin:
                                     print(f"🚧 [Visión Saturada] '{modelo}' lleva {intentos_saturacion} intentos con 'over capacity' - dejo de rotar keys, paso a Gemini como respaldo.")
                                     break
                             continue
+            except self.ERRORES_RED as e:
+                fallas_red += 1
+                self._marcar_red(False)
+                print(f"⏱️ Groq Key #{groq_idx} fallo de red: {type(e).__name__}: {e!r} | hilos={threading.active_count()} | fallas_red={fallas_red}")
+                if fallas_red >= self.MAX_FALLAS_RED_POR_REQUEST:
+                    print("🛑 [Groq] Fallas de red seguidas: es la conexión, no la key. Corto sin seguir rotando.")
+                    return None, None
+                continue
             except Exception as e:
-                print(f"⚠️ Error Groq Key #{groq_idx}: {e}")
+                print(f"⚠️ Error Groq Key #{groq_idx}: {type(e).__name__}: {e!r}")
                 continue
 
         return None, None
 
     # --- REQUEST A GEMINI (RESPALDO, con rotación "pegajosa" de MODELO y de key) ---
-    async def request_gemini(self, system_instruction: str, history: list, prompt: str, images: list = None,
+    async def request_gemini(self, *args, prioridad: str = "alta", **kwargs) -> tuple:
+        """Misma firma de siempre + prioridad="alta"|"baja" (baja = modo ambiental / auto-aprendizaje)."""
+        sem = await self._adquirir(prioridad)
+        if sem is None:
+            print("⏭️ [Gemini] request de baja prioridad omitida (red en pausa u otra tarea de fondo en curso)")
+            return None, None
+        try:
+            return await self._request_gemini_impl(*args, prioridad=prioridad, **kwargs)
+        finally:
+            sem.release()
+
+    async def _request_gemini_impl(self, system_instruction: str, history: list, prompt: str, images: list = None,
                               guild_id: int = 0, channel_id: int = 0, author_id: int = 0, author_name: str = "",
-                              usar_tools: bool = False, target_message: discord.Message = None) -> tuple:
+                              usar_tools: bool = False, target_message: discord.Message = None,
+                              prioridad: str = "alta") -> tuple:
         """Igual que antes, pero ahora hay DOS ruletas: la de MODELO (GEMINI_MODELS_FALLBACK) por
         fuera, y la de API KEY (GEMINI_API_KEYS) por dentro - ambas 'pegajosas' (se quedan en lo
         último que funcionó). Solo se salta al siguiente MODELO cuando el problema es del modelo
@@ -431,6 +568,9 @@ class MotorIAMixin:
         429 normal de cuota sigue rotando keys dentro del mismo modelo, igual que antes."""
         if not GEMINI_API_KEYS: return None, None
         if not images: images = []
+
+        inicio = time.monotonic()
+        fallas_red = 0
 
         num_keys = len(GEMINI_API_KEYS)
         num_modelos = len(GEMINI_MODELS_FALLBACK)
@@ -471,11 +611,19 @@ class MotorIAMixin:
             for pos in orden_keys:
                 gemini_idx = pos + 1
                 gemini_key = GEMINI_API_KEYS[pos]
+                if self._sin_presupuesto(inicio, prioridad):
+                    print(f"⏱️ [Gemini] Se acabó el presupuesto de tiempo ({prioridad}), corto sin seguir rotando keys/modelos.")
+                    return None, None
+                if self._en_cooldown("gemini", pos, modelo_actual):
+                    continue
                 try:
-                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo_actual}:generateContent?key={gemini_key}"
+                    # La key va por header (antes iba en la URL y podía acabar en logs/tracebacks).
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo_actual}:generateContent"
+                    headers_k = {**headers, "x-goog-api-key": gemini_key}
 
-                    async with aiohttp.ClientSession() as session:
-                        async with session.post(url, json=payload, headers=headers, timeout=30) as resp:
+                    async with self._http_ctx() as session:
+                        async with session.post(url, json=payload, headers=headers_k, timeout=self._timeout(prioridad)) as resp:
+                            self._marcar_red(True)
                             if resp.status == 200:
                                 data = await resp.json()
                                 if 'candidates' not in data or not data['candidates']:
@@ -518,11 +666,17 @@ class MotorIAMixin:
                                     # esta se queda sin cuota justo después.
                                     final_text = None
                                     final_gemini_idx = gemini_idx
+                                    inicio2 = time.monotonic()
                                     for pos2 in orden_keys:
+                                        if self._sin_presupuesto(inicio2, prioridad):
+                                            print("⏱️ [Gemini] Sin presupuesto de tiempo en la 2da llamada (tras tools), corto.")
+                                            break
+                                        if self._en_cooldown("gemini", pos2, modelo_actual):
+                                            continue
                                         key2 = GEMINI_API_KEYS[pos2]
-                                        url2 = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo_actual}:generateContent?key={key2}"
+                                        url2 = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo_actual}:generateContent"
                                         try:
-                                            async with session.post(url2, json=payload, headers=headers, timeout=30) as resp2:
+                                            async with session.post(url2, json=payload, headers={**headers, "x-goog-api-key": key2}, timeout=self._timeout(prioridad)) as resp2:
                                                 if resp2.status == 200:
                                                     data2 = await resp2.json()
                                                     cands2 = data2.get('candidates')
@@ -538,8 +692,10 @@ class MotorIAMixin:
                                                 else:
                                                     error_body2 = await resp2.text()
                                                     print(f"⚠️ Gemini Key #{pos2 + 1} [{modelo_actual}] - (2da llamada, tras tools) Status {resp2.status} - Detalle: {error_body2[:300]}")
+                                                    if resp2.status == 429:
+                                                        self._poner_cooldown("gemini", pos2, modelo_actual)
                                         except Exception as e2:
-                                            print(f"⚠️ Error Gemini Key #{pos2 + 1} [{modelo_actual}] en 2da llamada (tras tools): {e2}")
+                                            print(f"⚠️ Error Gemini Key #{pos2 + 1} [{modelo_actual}] en 2da llamada (tras tools): {type(e2).__name__}: {e2!r}")
 
                                     if final_text:
                                         texto_final = self.clean_ai_response(final_text)
@@ -564,14 +720,24 @@ class MotorIAMixin:
                             else:
                                 error_body = await resp.text()
                                 print(f"⚠️ Gemini Key #{gemini_idx} [{modelo_actual}] - Status {resp.status} - Detalle: {error_body[:300]}")
+                                if resp.status == 429:
+                                    self._poner_cooldown("gemini", pos, modelo_actual)
                                 cuerpo_low = error_body.lower()
                                 # Problema del MODELO (no de la key): no existe/deprecado, o saturado por demanda alta.
                                 if resp.status == 404 or resp.status == 503 or "overloaded" in cuerpo_low or "unavailable" in cuerpo_low or "not found" in cuerpo_low:
                                     saltar_modelo = True
                                     break
                                 continue
+                except self.ERRORES_RED as e:
+                    fallas_red += 1
+                    self._marcar_red(False)
+                    print(f"⏱️ Gemini Key #{gemini_idx} [{modelo_actual}] fallo de red: {type(e).__name__}: {e!r} | hilos={threading.active_count()} | fallas_red={fallas_red}")
+                    if fallas_red >= self.MAX_FALLAS_RED_POR_REQUEST:
+                        print("🛑 [Gemini] Fallas de red seguidas: es la conexión, no la key. Corto sin seguir rotando.")
+                        return None, None
+                    continue
                 except Exception as e:
-                    print(f"⚠️ Error Gemini Key #{gemini_idx} [{modelo_actual}]: {e}")
+                    print(f"⚠️ Error Gemini Key #{gemini_idx} [{modelo_actual}]: {type(e).__name__}: {e!r}")
                     continue
 
             if saltar_modelo:
@@ -645,8 +811,8 @@ class MotorIAMixin:
         for emoji_name, emoji_id in matches:
             try:
                 emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.png"
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(emoji_url, timeout=5) as resp:
+                async with self._http_ctx() as session:
+                    async with session.get(emoji_url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
                         if resp.status == 200:
                             img_bytes = await resp.read()
                             mime_c, img_bytes_c = self.comprimir_imagen(img_bytes, "image/png")
@@ -720,9 +886,9 @@ class MotorIAMixin:
                 "duraderos como gustos musicales, peliculas, cosas favoritas, etc."
             )
             
-            response_text, _ = await self.request_gemini(system_for_learning, [], prompt_for_learning)
+            response_text, _ = await self.request_gemini(system_for_learning, [], prompt_for_learning, prioridad="baja")
             if not response_text:
-                response_text, _ = await self.request_groq(system_for_learning, [], prompt_for_learning, guild_id, 0, [], usar_tools=False)
+                response_text, _ = await self.request_groq(system_for_learning, [], prompt_for_learning, guild_id, 0, [], usar_tools=False, prioridad="baja")
 
             if response_text and "sin_cambios" not in response_text.lower() and not _parece_rechazo_del_modelo(response_text):
                 tipo_match = re.search(r'TIPO:\s*(PUBLICO|PRIVADO|GENERO)', response_text, re.IGNORECASE)
@@ -799,4 +965,3 @@ class MotorIAMixin:
             "eso de", "por lo de", "ahorita que dij", "lo que dijiste", "dijiste que"
         ]
         return any(ref in texto for ref in referencias)
-

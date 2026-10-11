@@ -49,12 +49,17 @@ class AIModule(commands.Cog, PerfilesMixin, MemoriaChatMixin, BusquedaWebMixin, 
         self.ultimo_dia_revisado_cumple = None
         self.check_birthdays_loop.start()
 
-    def cog_unload(self):
+    async def cog_unload(self):
         self.check_birthdays_loop.cancel()
         # Cancelar cualquier temporizador de "soltar lote pendiente" que siga corriendo
         for task in self.ambient_flush_timer.values():
             if task and not task.done():
                 task.cancel()
+        # 🛠️ Cierra la sesión HTTP compartida del motor de IA (evita "Unclosed client session" de este cog)
+        try:
+            await self.cerrar_http_ia()
+        except Exception as e:
+            print(f"⚠️ Error cerrando la sesión HTTP de la IA: {type(e).__name__}: {e!r}")
 
     @tasks.loop(hours=1)
     async def check_birthdays_loop(self):

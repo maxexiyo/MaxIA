@@ -8,16 +8,19 @@ Hay dos tipos de segmento:
                 y resuelto en Lavalink también.
 """
 import asyncio
+import hashlib
 import inspect
 import json
 import logging
 import os
 import random
 import re
+import shutil
 import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from . import config as C
 from .emisora import Segmento
@@ -34,9 +37,9 @@ logger = logging.getLogger(__name__)
 
 SISTEMA = (f"Eres {C.LOCUTORA}, la locutora de {C.NOMBRE}, una estación de radio por internet en español "
            f"(México y Latinoamérica). Suenas como una persona real frente al micrófono, NO como un asistente: "
-           f"platicas con el oyente como con un cuate, con humor ligero, calidez y energía. "
-           f"Usa lenguaje coloquial mexicano natural (¿qué onda?, la verdad, fíjate que, ándale, qué rolón, "
-           f"está padrísima) sin exagerar ni caer en caricatura. Varía tu forma de empezar y de cerrar: nunca "
+           f"platicas con el oyente de forma cercana, con humor ligero, calidez y energía. "
+           f"Usa lenguaje coloquial mexicano natural (la verdad, fíjate que, ándale, qué rolón, "
+           f"está padrísima) sin exagerar ni caer en caricatura. NUNCA digas «qué onda», «cuate» ni «qué onda cuate»: están prohibidos. Cuando saludes, inventa un saludo distinto y original cada vez, nada de fórmulas repetidas. Varía tu forma de empezar y de cerrar: nunca "
            f"arranques dos veces igual ni uses fórmulas tipo «a continuación» o «a petición del público». "
            f"Mezcla frases cortas con alguna más larga, usa muletillas suaves, preguntas retóricas, exclamaciones "
            f"y pequeñas pausas con comas o puntos suspensivos para dar ritmo al leerse en voz alta. "
@@ -51,7 +54,7 @@ SALUDOS_APERTURA = [
     "¡Muy buenas! Soy {loc} y esto es {est}. Son {hora}. Qué gusto tenerte por aquí, ¡arrancamos!",
     "¡Hola, hola! Aquí {loc}, al aire en {est}. Son {hora}. Acomódate que empieza lo bueno.",
     "{est}, ya estamos al aire. Yo soy {loc}, son {hora}, y la música no se detiene.",
-    "¡Qué onda, qué onda! Ya llegó {loc} a {est}. Son {hora}, así que súbele tantito que hoy se viene bien bonito.",
+    "¡Llegó la hora de la música! Ya estás con {loc} en {est}. Son {hora}, así que súbele tantito que hoy se viene bien bonito.",
     "Hey, hola, ¿cómo estás? Soy {loc}, estás en {est} y son {hora}. Ponte cómodo, que yo me encargo de la música.",
     "¡Y estamos de regreso! {est}, con {loc} en cabina. Son {hora}. Agárrate, porque arrancamos con todo.",
 ]
@@ -72,6 +75,8 @@ NOTICIERO_PREARMADO_S = 540      # se empieza a armar ~9 min antes de la hora, e
 NOTICIERO_HORAS = range(6, 24)   # 6:00 a 23:00; de 00:00 a 05:00 no hay noticiero
 NOTICIERO = {"intro": "noticiero/intro", "intro_max_seg": 20, "fondo": "noticiero/fondo",      # en radio_data/audio/programas/
              "outro": True, "outro_max_seg": 20}   # outro: al terminar la voz de cierre vuelve a sonar la musiquita de la intro
+SILENCIO_SIN_OYENTES = os.getenv("RADIO_SILENCIO_SIN_OYENTES", "1") != "0"   # sin oyentes: solo música (el noticiero sí suena)
+VOCES_HORA_MAX = int(os.getenv("RADIO_VOCES_HORA_MAX", "800"))   # voces de la hora guardadas en radio_data/voces_hora/ (al pasarse, se borran las más viejas)
 ENFRIAMIENTO_CANCION_S = 2 * 3600   # una canción (propuesta o pedida) no vuelve a sonar hasta pasadas 2 horas
 TTL_CACHE_JINGLE_S = 5 * 3600     # las URLs de los archivos subidos a Discord caducan; se vuelven a subir
 # ── Ahorro de búsquedas web (ver busqueda_web.py: caché + conocimiento propio primero) ──
@@ -118,14 +123,18 @@ def _acepta(fn):
 class Director:
     def __init__(self, emisora, *, buscar_cancion, publicar, ia=pedir_ia, tts=sintetizar,
                  noticias=obtener_noticias, describir=describir_imagen, ahora=C.ahora_local,
-                 buscar_web=buscar_info, exitos=exitos_del_pais):
+                 buscar_web=buscar_info, exitos=exitos_del_pais, oyentes=None, nodos_listos=None):
         """
         buscar_cancion(artista, titulo) -> dict(track, titulo, artista, duracion, portada, url) | None
         buscar_web(consulta)            -> texto con lo encontrado en internet | None   (tu IA con búsqueda web)
         exitos(pais, cantidad)          -> [{"artista","titulo"}]  lo más escuchado del país | []
+        oyentes()                       -> int  personas escuchando (0 = Maxia no habla, solo música; el noticiero sí suena)
+        nodos_listos()                  -> bool  ¿hay algún nodo de Lavalink conectado? (si no, se pausa el armado)
         publicar(ruta_mp3)              -> track de Lavalink | None   (sube el archivo y lo resuelve)
         """
         self.emisora = emisora
+        self.oyentes, self.nodos_listos = oyentes, nodos_listos
+        self._nodos_caidos = False
         self.buscar_cancion, self.publicar = buscar_cancion, publicar
         self.ia, self.tts, self.noticias, self.describir, self.ahora = ia, tts, noticias, describir, ahora
         self.buscar_web, self.exitos = buscar_web, exitos
@@ -195,6 +204,24 @@ class Director:
     async def _web_sin_memoria(self, consulta: str, *args, **kwargs):
         """Para datos exactos (p. ej. en qué segundo entra la voz): siempre internet, nunca la memoria del modelo."""
         return await self._web(consulta, conocimiento=False)
+
+    def _sin_oyentes(self) -> bool:
+        """True si no hay nadie escuchando (la radio sigue al aire, pero Maxia no habla ni se gasta IA/TTS)."""
+        if self.oyentes is None or not SILENCIO_SIN_OYENTES:
+            return False
+        try:
+            return self.oyentes() <= 0
+        except Exception:
+            return False
+
+    def _nodos_ok(self) -> bool:
+        """True si hay al menos un nodo de Lavalink conectado (si no se puede saber, se asume que sí)."""
+        if self.nodos_listos is None:
+            return True
+        try:
+            return bool(self.nodos_listos())
+        except Exception:
+            return True
 
     def _jingle(self, nombres, max_seg=12):
         for n in nombres:
@@ -292,17 +319,39 @@ class Director:
 
     async def _transicion(self, nueva: str, apertura: bool = False, t_cambio=None):
         """Todo lo que va entre programas (y la apertura de la transmisión) en UN solo audio, armado ANTES del cambio:
-        saludo (solo en la apertura) + despedida del programa anterior + presentación del nuevo."""
+        saludo (solo en la apertura) + despedida del programa anterior + presentación del nuevo.
+        Sin oyentes: no se habla; solo la primera canción del programa nuevo (o el noticiero si toca)."""
         previo, self.programa_activo = self.programa_activo, nueva
         if previo and previo != nueva:
             self._descartar_canciones_del_programa_anterior()
         self._cambio_planeado = t_cambio            # None = cambio inmediato; fecha = transición armada antes de su hora
-        self.fondo_programa = await self.elegir_fondo(nueva, rapido=apertura)
+        mudo = self._sin_oyentes()
+        self.fondo_programa = await self.elegir_fondo(nueva, rapido=apertura or mudo)
+
+        tn = None
+        if not apertura:                                   # ¿justo a esta hora toca noticiero? (p. ej. 6:00: buenos días y noticias)
+            tn = self._hora_noticiero()
+            if tn is not None:
+                dif = (tn - (t_cambio or self.ahora())).total_seconds()
+                if not ((abs(dif) <= 60) if t_cambio is not None else (-600 <= dif <= 60)):
+                    tn = None
+
+        if mudo:                                           # nadie escucha: solo música (y el noticiero si toca)
+            out = []
+            if tn is None:
+                c = await self._siguiente_cancion(nueva)
+                if c is not None:
+                    out.append(c)
+            else:
+                out += await self._noticiero_para(tn, nueva)
+                self.n_hora = 0
+            return out
+
         partes = []
         saludo = ""
         if apertura:
             d = self._datos_voz()
-            saludo = (f"Primero saluda con energía: eres {d['loc']}, estás en {d['est']} y son «{d['hora']}» "
+            saludo = (f"Primero saluda con energía, con un saludo original que inventes tú (nada de «qué onda» ni «cuate»): eres {d['loc']}, estás en {d['est']} y son «{d['hora']}» "
                       f"(escríbela tal cual). ")
         if previo and previo != nueva and PROGRAMAS[previo].get("charla"):
             partes.append(await self._texto(
@@ -316,13 +365,6 @@ class Director:
             partes.append(await self._texto(PROGRAMAS[nueva]["al_entrar"], 200)
                           or "Ya es medianoche y yo me despido por esta noche. Les dejo música para la madrugada, y a las seis de la mañana nos vemos de nuevo. ¡Que descansen!")
         cancion = None
-        tn = None
-        if not apertura:                                   # ¿justo a esta hora toca noticiero? (p. ej. 6:00: buenos días y noticias)
-            tn = self._hora_noticiero()
-            if tn is not None:
-                dif = (tn - (t_cambio or self.ahora())).total_seconds()
-                if not ((abs(dif) <= 60) if t_cambio is not None else (-600 <= dif <= 60)):
-                    tn = None
         if PROGRAMAS[nueva].get("charla") and tn is None:
             # La presentación del programa y la anécdota de la PRIMERA canción van en el mismo audio
             cancion = await self._siguiente_cancion(nueva)
@@ -480,6 +522,9 @@ class Director:
                 continue
             r = await self.buscar_cancion(c["artista"], c["titulo"])
             if not r:
+                if not self._nodos_ok():             # nodos caídos: no se quema la canción ni se gasta más IA
+                    self.pendientes.appendleft(c)
+                    return None
                 logger.warning(f"[radio] Lavalink no encontró: {c['artista']} - {c['titulo']}")
                 continue
             self.historial.append(f"{c['artista']} - {c['titulo']}")
@@ -583,6 +628,8 @@ class Director:
         prog = PROGRAMAS[clave]
         cancion = await self._siguiente_cancion(clave)
         if cancion is None:                     # sin canciones: una charla de relleno, pero nunca dos seguidas
+            if self._sin_oyentes() or not self._nodos_ok():
+                return []
             self._relleno_seguido += 1
             return await self.bloque_charla(clave) if self._relleno_seguido <= 1 else []
         self._relleno_seguido = 0
@@ -593,7 +640,7 @@ class Director:
             self._reservada = cancion
             return await self._transicion(programa_para(t_cambio), t_cambio=t_cambio)
 
-        if prog.get("solo_musica"):
+        if prog.get("solo_musica") or self._sin_oyentes():
             return [cancion]
 
         self.n_hora += 1
@@ -640,12 +687,52 @@ class Director:
         s = await self._segmento(texto, fondo=fondo, programa=prog["nombre"], etiqueta="charla")
         return [s] if s else []
 
+    def _podar_voces_hora(self, carpeta) -> None:
+        archivos = sorted((p for p in carpeta.glob("hora_*.*") if p.is_file()), key=lambda p: p.stat().st_mtime)
+        for p in archivos[:max(0, len(archivos) - VOCES_HORA_MAX)]:
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    async def _voz_hora(self, texto: str):
+        """Voz de la hora SOLA (sin cortinilla ni fondo), guardada en radio_data/voces_hora/. Si ese mismo texto ya se
+        generó antes, se reutiliza y no se gasta TTS; la mezcla le pone encima la cortinilla/fondo del programa de turno."""
+        carpeta, h = None, None
+        try:
+            carpeta = C.DIR_RADIO / "voces_hora"
+            carpeta.mkdir(parents=True, exist_ok=True)
+            h = hashlib.sha1(_norm(texto).encode("utf-8")).hexdigest()[:16]
+            for p in carpeta.glob(f"hora_{h}.*"):
+                if p.stat().st_size > 1000:
+                    p.touch()                      # la usada más recientemente es la última en borrarse
+                    return str(p)
+        except Exception as e:
+            logger.debug(f"[radio] no pude leer voces_hora: {e!r}")
+            carpeta = None
+        ruta = await self.tts(texto)
+        if not ruta or carpeta is None:
+            return ruta
+        if not Path(ruta).name.startswith(("voz_g_", "voz_o_")):      # solo Gemini TTS (cog TTS o vía OpenRouter); edge/Piper/Kokoro no se guardan
+            return ruta
+        try:
+            destino = carpeta / f"hora_{h}{Path(ruta).suffix}"
+            await asyncio.to_thread(shutil.copyfile, ruta, destino)
+            self._podar_voces_hora(carpeta)
+            return str(destino)
+        except Exception as e:
+            logger.debug(f"[radio] no pude guardar la voz de la hora: {e!r}")
+            return ruta
+
     async def bloque_hora(self, clave: str):
         """Solo la hora exacta, con la cortinilla del programa (o el motivo de tres notas si no tiene)."""
         self.n_hora = 0
         self.meta_hora = random.randint(*C.CANCIONES_ENTRE_HORA)
+        voz = await self._voz_hora(anuncio_hora(self._ahora_al_aire()))
+        if not voz:
+            return []
         s = await self._segmento(
-            anuncio_hora(self._ahora_al_aire()),
+            None, voz_ruta=voz,
             inicio=self._cortinilla(clave) or self._stinger(),
             programa=PROGRAMAS[clave]["nombre"], etiqueta="hora")
         return [s] if s else []
@@ -921,6 +1008,9 @@ class Director:
             if segs:
                 return segs
 
+        if self._sin_oyentes():                 # nadie escucha: solo música (el noticiero de arriba sí se emite)
+            return await self.bloque_cancion(clave)
+
         if self.mensajes:
             pasos = await self.bloque_mensajes(clave)
             if pasos:
@@ -975,6 +1065,14 @@ class Director:
         """Callback de la emisora: mantiene la cola con unos segmentos por delante."""
         if self._lock.locked():
             return
+        if not self._nodos_ok():                 # sin nodos de Lavalink: no se arma nada ni se gasta IA/TTS
+            if not self._nodos_caidos:
+                self._nodos_caidos = True
+                logger.warning("[radio] sin nodos de Lavalink: pauso el armado hasta que vuelvan")
+            return
+        if self._nodos_caidos:
+            self._nodos_caidos = False
+            logger.info("[radio] nodos de vuelta: sigo armando la programación")
         async with self._lock:
             intentos = 0
             while (len(emisora.cola) < C.COLA_OBJETIVO or self._tiempo_en_cola() < MIN_SEGUNDOS_PREPARADOS) \
@@ -988,6 +1086,8 @@ class Director:
                     continue
                 if segs:
                     emisora.encolar(*segs)
+                elif not self._nodos_ok():
+                    break
             if random.random() < 0.1:
                 limpiar_cache()
 

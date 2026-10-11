@@ -141,3 +141,9 @@ AMBIENT_BATCH_SIZE = 20            # cuántos mensajes se juntan antes de evalua
 AMBIENT_BATCH_IDLE_FLUSH = 12     # segundos sin mensajes nuevos para soltar el lote pendiente aunque no se haya llenado
 AMBIENT_COOLDOWN_SECONDS = 180    # mínimo tiempo entre intervenciones ambientales por canal (súbelo/bájalo para que hable menos/más seguido)
 
+
+# 🛠️ ANTI-AVALANCHA DEL MODO AMBIENTAL (parche):
+# Antes el bot evaluaba CADA mensaje con la IA (el filtro random era `<= 1`, o sea siempre pasaba) y el
+# único cooldown se activaba solo cuando el bot hablaba/reaccionaba; como casi siempre responde NADA, no había freno.
+AMBIENT_EVAL_PROBABILITY = 1.0     # prob. de evaluar un mensaje suelto (1.0 = todos, como estaba; baja a 0.3 para gastar menos)
+AMBIENT_MIN_EVAL_INTERVAL = 30     # seg mínimos entre evaluaciones por canal, haya hablado o no (sube a 60+ para gastar menos)

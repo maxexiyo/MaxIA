@@ -106,7 +106,7 @@ PROGRAMAS = {
         "generos": ("cumbias famosas y bailables: cumbia sonidera y mexicana (Los Ángeles Azules, Grupo Cañaveral, Celso Piña, "
                     "Los Askis, Grupo Quintanilla / Selena, Kumbia Kings, Rigo Tovar), colombiana (Aniceto Molina, Los Corraleros "
                     "de Majagual, La 33, Carlos Vives), argentina (Los Palmeras, Damas Gratis, Gilda, Amar Azul), "
-                    "peruana (Los Mirlos, Juaneco y su Combo, Grupo 5), chilena y cumbia clásica"),
+                    "peruana (Los Mirlos, Juaneco y su Combo, Grupo 5), chilena y cumbia clásica y algunas populares y famosas que se suelen poner en fiestas: de artistas como pitbull, caballo dorado, etc" ),
         "charla": True,
         "noticias": True,
         "busqueda": "cumbias más famosas bailables clásicos sonideras",

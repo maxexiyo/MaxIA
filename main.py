@@ -22,6 +22,7 @@ from discord.ext import commands
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import io
 import logging
 import vigilante   # evita que un bloqueo deje todo el bot congelado (ver vigilante.py)
 
@@ -94,6 +95,14 @@ async def on_command_error(ctx, error):
     else:
         logger.error(f'Error: {error}')
         await ctx.send(f'❌ Error: {error}')
+
+@bot.command(name="diagnostico")
+@commands.is_owner()
+async def diagnostico(ctx):
+    """Qué está esperando cada tarea del bot (solo el dueño). Úsalo cuando algo se queda 'pensando' y no termina."""
+    texto = vigilante.volcar_tareas()
+    logger.warning(f"[vigilante] diagnóstico pedido por {ctx.author}:\n{texto}")
+    await ctx.send(file=discord.File(io.BytesIO(texto.encode("utf-8")), filename="tareas.txt"))
 
 async def main():
     """Función principal"""

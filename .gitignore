@@ -6,6 +6,7 @@ oauth.json
 browser.json
 cookies*.txt
 ignored_channels.txt
+*.txt
 __pycache__/
 *.pyc
 venv/

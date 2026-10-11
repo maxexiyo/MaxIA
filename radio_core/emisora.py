@@ -31,6 +31,9 @@ class Segmento:
 
 
 class Emisora:
+    GRACIA_RESYNC_S = 6.0        # tras mandar un play() a un servidor, se le da este tiempo antes de revisar si de verdad suena
+    ESPERA_RESYNC_S = 5.0        # espera entre reintentos de un servidor que no suena (se duplica en cada fallo, tope 60 s)
+
     def __init__(self, umbral_cola: int = C.COLA_OBJETIVO):
         self.cola: deque = deque()
         self.actual: Optional[Segmento] = None
@@ -48,6 +51,9 @@ class Emisora:
         self._idle_avisado = False
         self._fin_real = False                   # TODOS los servidores confirmaron que el segmento actual terminó de sonar
         self._fines: set = set()                 # servidores que ya reportaron el fin del segmento actual
+        self._ultimo_tocar: dict = {}            # guild_id -> cuándo se le mandó el último play()
+        self._resync: dict = {}                  # guild_id -> (cuándo fue el último reintento, cuántos van)
+        self._resync_en_curso: set = set()
 
     # ── API ──
     @property
@@ -85,9 +91,22 @@ class Emisora:
                 pass
         self.actual = None
         self.cola.clear()
+        self._ultimo_tocar.clear()
+        self._resync.clear()
         if self._tareas:
             await asyncio.gather(*list(self._tareas), return_exceptions=True)
         logger.info("[emisora] fuera del aire")
+
+    def oyentes_humanos(self) -> int:
+        """Personas (no bots) que escuchan ahora: miembros humanos en los canales de voz de los servidores conectados.
+        0 = nadie escucha (la radio puede seguir al aire, pero sin hablar). Si no se puede saber, se asume que hay alguien."""
+        total = 0
+        for vc in list(self.sesiones.values()):
+            try:
+                total += sum(1 for m in vc.channel.members if not m.bot)
+            except Exception:
+                total += 1
+        return total
 
     def notificar_fin(self, guild_id: int, encoded: str, razon: str) -> None:
         """Lo llama el cog con cada TrackEnd de Lavalink. Solo cuenta si es el track que suena ahora y terminó de
@@ -107,14 +126,26 @@ class Emisora:
             self._fin_real = True
 
     async def agregar_sesion(self, guild_id: int, vc) -> None:
-        """Un servidor se conecta: entra a media transmisión, justo donde va la radio."""
+        """Un servidor se conecta: entra a media transmisión, justo donde va la radio (por reloj)."""
         self.sesiones[guild_id] = vc
+        self._resync.pop(guild_id, None)
+        self._fines.discard(guild_id)
         if self.actual is not None:
-            await self._tocar(guild_id, vc, self.actual, self.posicion())
+            self._lanzar(self._entrar_a_media(guild_id, vc))
+
+    async def _entrar_a_media(self, gid: int, vc) -> None:
+        for _ in range(24):                      # hasta ~12 s a que el player termine de conectarse
+            if getattr(vc, "connected", True) and getattr(vc, "channel", None) is not None:
+                break
+            await asyncio.sleep(0.5)
+        if self.sesiones.get(gid) is vc and self.actual is not None:
+            await self._tocar(gid, vc, self.actual, self.posicion())
 
     async def quitar_sesion(self, guild_id: int) -> None:
         self.sesiones.pop(guild_id, None)
         self._fines.discard(guild_id)
+        self._ultimo_tocar.pop(guild_id, None)
+        self._resync.pop(guild_id, None)
         # si el que se fue era el único que faltaba por terminar, ya se puede avanzar
         if self.actual is not None and self.sesiones and self._fines >= set(self.sesiones):
             self._fin_real = True
@@ -137,7 +168,7 @@ class Emisora:
     def estado(self) -> dict:
         e = {"al_aire": self._corriendo, "tipo": "idle", "programa": None, "voz_activa": False,
              "titulo": None, "artista": None, "portada": None, "url": None, "pedida_por": None,
-             "pos": 0.0, "dur": 0, "noticia": None, "siguiente": None, "oyentes": len(self.sesiones)}
+             "pos": 0.0, "dur": 0, "noticia": None, "siguiente": None, "oyentes": self.oyentes_humanos()}
         for s in self.cola:
             if s.tipo == "cancion":
                 e["siguiente"] = f"{s.meta.get('titulo', '?')} — {s.meta.get('artista', '')}".strip(" —")
@@ -176,6 +207,9 @@ class Emisora:
             logger.exception("[emisora] error en on_cambio")
 
     async def _tocar(self, gid: int, vc, seg: Segmento, start_s: float) -> None:
+        if start_s > 0 and start_s > seg.duracion - 1.5:
+            return                               # ya casi termina: se espera al siguiente segmento
+        self._ultimo_tocar[gid] = time.monotonic()
         try:
             await asyncio.wait_for(vc.play(seg.track, start=int(max(0.0, start_s) * 1000), add_history=False), C.PLAY_TIMEOUT)
         except TypeError:        # players que no aceptan add_history
@@ -185,6 +219,44 @@ class Emisora:
 
     async def _tocar_en_todos(self, seg: Segmento) -> None:
         await asyncio.gather(*(self._tocar(g, vc, seg, 0.0) for g, vc in list(self.sesiones.items())), return_exceptions=True)
+
+    def _revisar_sesiones(self) -> None:
+        """Red de seguridad: si un servidor conectado NO está tocando lo que suena ahora (entró a media transmisión y el
+        play() falló o llegó antes de que terminara de conectarse, o su nodo se cayó), se le vuelve a mandar, justo en el
+        punto donde va la radio. Con espera creciente entre intentos para no insistir sin parar con un servidor roto."""
+        a = self.actual
+        if a is None or not self.sesiones:
+            return
+        ahora = time.monotonic()
+        if ahora - self._t_inicio < 3.0 or ahora - self._t_inicio > a.duracion - 2.0:
+            return                                    # recién cambió de segmento o ya está por terminar
+        enc = getattr(a.track, "encoded", None)
+        for gid, vc in list(self.sesiones.items()):
+            if gid in self._fines or gid in self._resync_en_curso:
+                continue
+            if not hasattr(vc, "current") and not hasattr(vc, "playing"):
+                continue                              # un player que no permite saberlo: no se toca
+            if ahora - self._ultimo_tocar.get(gid, 0.0) < self.GRACIA_RESYNC_S:
+                continue
+            actual_vc = getattr(vc, "current", None)
+            reproduciendo = bool(vc.playing) if hasattr(vc, "playing") else actual_vc is not None
+            mismo = enc is None or (actual_vc is not None and getattr(actual_vc, "encoded", None) == enc)
+            if reproduciendo and mismo:
+                self._resync.pop(gid, None)           # todo bien
+                continue
+            ultimo, fallos = self._resync.get(gid, (0.0, 0))
+            if ahora - ultimo < min(self.ESPERA_RESYNC_S * (2 ** fallos), 60.0):
+                continue
+            self._resync[gid] = (ahora, fallos + 1)
+            logger.warning(f"[emisora] servidor {gid}: no está tocando lo que suena ahora; se le reenvía (intento {fallos + 1})")
+            self._resync_en_curso.add(gid)
+            self._lanzar(self._resync_tarea(gid))
+
+    async def _resync_tarea(self, gid: int) -> None:
+        try:
+            await self.resincronizar(gid)
+        finally:
+            self._resync_en_curso.discard(gid)
 
     def _pedir_mas(self) -> None:
         if self.on_cola_baja is None or self._rellenando or time.monotonic() < self._no_antes_de:
@@ -231,6 +303,7 @@ class Emisora:
         while self._corriendo:
             try:
                 await self._avanzar()
+                self._revisar_sesiones()
                 if self.on_tick is not None:
                     self.on_tick(self)
                 if len(self.cola) < self.umbral_cola:

@@ -5,6 +5,7 @@ y todo el modo ambiental (detectar cuándo meterse sin ser invocado, agrupar
 mensajes en lotes cuando el canal está muy activo, etc.).
 """
 import re
+import time
 import random
 import base64
 import asyncio
@@ -20,6 +21,8 @@ from ia_core.config import (
     AMBIENT_BATCH_SIZE,
     AMBIENT_BATCH_IDLE_FLUSH,
     AMBIENT_COOLDOWN_SECONDS,
+    AMBIENT_EVAL_PROBABILITY,
+    AMBIENT_MIN_EVAL_INTERVAL,
 )
 
 
@@ -338,6 +341,9 @@ class EventosMixin:
 
             if not response_text: 
                 print(f"❌ [Error Crítico] Se agotaron las cuotas de Gemini Y Groq en `{server_name}` #{channel_name}.")
+                if self._red_en_pausa():
+                    # 🛠️ No es cuota: se cayó la conexión (timeouts). No culpar a las cuotas.
+                    return await message.channel.send("uff se me cayó la conexión con la IA un momento, intenta de nuevo en un ratito :v")
                 return await message.channel.send("awantaaa se agotaron TODAS las cuotas (Gemini y Groq) :v")
             
             if gemini_key_idx:
@@ -377,7 +383,7 @@ class EventosMixin:
                     contexto_aprendizaje = f"{contexto_aprendizaje}\n{reply_context_text}".strip()
                 asyncio.create_task(self.auto_learn_user_info(message.author.id, author_name, prompt, guild_id, contexto_aprendizaje))
 
-        except Exception as e: print(f"❌ Error grave procesando solicitud en `{server_name}` #{channel_name}: {e}")
+        except Exception as e: print(f"❌ Error grave procesando solicitud en `{server_name}` #{channel_name}: {type(e).__name__}: {e!r}")
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -531,6 +537,32 @@ class EventosMixin:
         except Exception as e:
             print(f"⚠️ Error evaluando mención por nombre: {e}")
 
+    def _ambient_reservar_evaluacion(self, channel_id: int, tipo: str = "suelto") -> bool:
+        """🛠️ Freno por canal para el modo ambiental. Antes el único cooldown se activaba cuando el bot
+        HABLABA o REACCIONABA; como casi siempre decide NADA, NO había freno y cada mensaje disparaba una
+        llamada a la IA. Ahora, haya hablado o no, se deja pasar como máximo UNA evaluación cada
+        AMBIENT_MIN_EVAL_INTERVAL segundos por canal (y por tipo: mensaje suelto / lote).
+        Es síncrona (sin await) a propósito: revisar y reservar es atómico entre tareas."""
+        ult = getattr(self, "_ambient_ultima_eval", None)
+        if ult is None:
+            ult = self._ambient_ultima_eval = {}
+        clave = (channel_id, tipo)
+        ahora = time.monotonic()
+        previo = ult.get(clave)
+        if previo is not None and (ahora - previo) < AMBIENT_MIN_EVAL_INTERVAL:
+            return False
+        ult[clave] = ahora
+        return True
+
+    async def _aprender_del_lote(self, batch: list, guild_id: int, historial_lote: str):
+        """🛠️ Antes se lanzaba una tarea auto_learn por CADA mensaje del lote (20 llamadas a la IA de golpe).
+        Ahora se aprende de uno en uno, en una sola tarea de fondo, para no tumbar la API."""
+        for m in batch:
+            try:
+                await self.auto_learn_user_info(m["message"].author.id, m["author"], m["content"], guild_id, historial_lote)
+            except Exception as ex:
+                print(f"⚠️ Error aprendiendo del lote: {type(ex).__name__}: {ex!r}")
+
     def _channel_is_very_active(self, channel_id: int) -> bool:
         """Registra este mensaje en la ventana de tiempo y dice si el canal está 'muy activo'
         (suficientes mensajes seguidos en poco tiempo) como para agrupar en lote."""
@@ -598,7 +630,10 @@ class EventosMixin:
         self.ambient_pending_batch[channel_id] = []
 
         timer_task = self.ambient_flush_timer.pop(channel_id, None)
-        if timer_task and not timer_task.done():
+        # 🛠️ FIX: cuando el flush lo dispara el propio temporizador de silencio (idle_flush), este
+        # `timer_task` ES la tarea que está corriendo; cancelarla aquí hacía que la evaluación del lote
+        # se interrumpiera sola en su primer await (por eso nunca salía "decidió ... tras el lote").
+        if timer_task and timer_task is not asyncio.current_task() and not timer_task.done():
             timer_task.cancel()
 
         try:
@@ -611,6 +646,9 @@ class EventosMixin:
             last_time = self.last_ambient_time.get(channel_id)
             if last_time and (now - last_time).total_seconds() < AMBIENT_COOLDOWN_SECONDS:
                 print(f"📦 [Modo Ambiental] Lote descartado en #{channel_name} (cooldown activo) — motivo del flush: {motivo}")
+                return
+            if not self._ambient_reservar_evaluacion(channel_id, "lote"):
+                print(f"📦 [Modo Ambiental] Lote descartado en #{channel_name} (ya se evaluó un lote hace menos de {AMBIENT_MIN_EVAL_INTERVAL}s) — motivo del flush: {motivo}")
                 return
 
             # 🔑 Cada línea lleva quién la dijo, mismo formato [Nombre]: que el resto del prompt,
@@ -666,10 +704,10 @@ class EventosMixin:
             )
 
             print(f"🤖 [Modo Ambiental] Evaluando LOTE de {len(batch)} mensajes en `{server_name}` #{channel_name} ({motivo})...")
-            respuesta, _ = await self.request_gemini(system_eval, [], prompt_eval, imagenes, guild_id=guild_id, channel_id=channel_id, usar_tools=True, target_message=last_message)
+            respuesta, _ = await self.request_gemini(system_eval, [], prompt_eval, imagenes, guild_id=guild_id, channel_id=channel_id, usar_tools=True, target_message=last_message, prioridad="baja")
             if not respuesta:
                 print(f"⚠️ [Modo Ambiental] Gemini falló/agotado evaluando el lote en `{server_name}` #{channel_name}. Probando Groq como respaldo...")
-                respuesta, _ = await self.request_groq(system_eval, [], prompt_eval, guild_id, channel_id, imagenes, target_message=last_message)
+                respuesta, _ = await self.request_groq(system_eval, [], prompt_eval, guild_id, channel_id, imagenes, target_message=last_message, prioridad="baja")
             respuesta_limpia = self.clean_ai_response(respuesta) if respuesta else ""
             respuesta_limpia = self.format_custom_emojis(respuesta_limpia, last_message.guild)
             if self.es_respuesta_meta_ambiental(respuesta_limpia):
@@ -689,8 +727,7 @@ class EventosMixin:
                 print(f"🤐 [Modo Ambiental] La IA decidió NO decir nada tras el lote en `{server_name}` #{channel_name}")
 
             # 🧠 Aprende de cada mensaje del lote, igual que hacía antes mensaje por mensaje
-            for m in batch:
-                asyncio.create_task(self.auto_learn_user_info(m["message"].author.id, m["author"], m["content"], guild_id, historial_lote))
+            asyncio.create_task(self._aprender_del_lote(batch, guild_id, historial_lote))
         except Exception as e:
             print(f"⚠️ Error soltando el lote del modo ambiental: {e}")
 
@@ -709,9 +746,14 @@ class EventosMixin:
 
             # Probabilidad baja: no evaluamos en cada mensaje para no gastar tokens de más ni ser molestos
             valor_random = random.random()
-            paso_filtro = valor_random <= 1
+            paso_filtro = valor_random <= AMBIENT_EVAL_PROBABILITY
             print(f"🎲 [Modo Ambiental] Mensaje leído en `{server_name}` #{channel_name} | random={valor_random:.3f} | {'PASÓ ✅ (sigue evaluando)' if paso_filtro else 'NO PASÓ ❌ (se descarta)'}")
             if not paso_filtro:
+                return
+
+            # 🛠️ Freno anti-avalancha (ver _ambient_reservar_evaluacion): el mensaje igual queda guardado en el
+            # historial, así que la siguiente evaluación lo ve como contexto.
+            if not self._ambient_reservar_evaluacion(channel_id, "suelto"):
                 return
 
             if len(message.content.strip()) < 1 and not message.attachments:
@@ -752,10 +794,10 @@ class EventosMixin:
             )
 
             print(f"🤖 [Modo Ambiental] Preguntándole a la IA si vale la pena hablar en `{server_name}` #{channel_name}...")
-            respuesta, _ = await self.request_gemini(system_eval, [], prompt_eval, imagenes, guild_id=guild_id, channel_id=channel_id, usar_tools=True, target_message=message)
+            respuesta, _ = await self.request_gemini(system_eval, [], prompt_eval, imagenes, guild_id=guild_id, channel_id=channel_id, usar_tools=True, target_message=message, prioridad="baja")
             if not respuesta:
                 print(f"⚠️ [Modo Ambiental] Gemini falló/agotado en `{server_name}` #{channel_name}. Probando Groq como respaldo...")
-                respuesta, _ = await self.request_groq(system_eval, [], prompt_eval, guild_id, channel_id, imagenes, target_message=message)
+                respuesta, _ = await self.request_groq(system_eval, [], prompt_eval, guild_id, channel_id, imagenes, target_message=message, prioridad="baja")
             respuesta_limpia = self.clean_ai_response(respuesta) if respuesta else ""
             respuesta_limpia = self.format_custom_emojis(respuesta_limpia, message.guild)
             if self.es_respuesta_meta_ambiental(respuesta_limpia):

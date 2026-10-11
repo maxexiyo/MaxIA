@@ -144,7 +144,8 @@ class Radio(commands.Cog):
         # La voz usa tu cog TTS (Gemini con sus keys y cupos, y edge-tts de respaldo). Si quieres usar TU módulo de IA
         # para los textos: Director(..., ia=mi_funcion_ia)  con  ia(prompt, sistema, *, json_mode=False, max_tokens=900) -> str
         self.director = Director(self.emisora, buscar_cancion=self._buscar_cancion, publicar=self._publicar, tts=self._tts,
-                                 buscar_web=self._buscar_web, exitos=self._exitos)
+                                 buscar_web=self._buscar_web, exitos=self._exitos,
+                                 oyentes=self.emisora.oyentes_humanos, nodos_listos=self._nodos_listos)
         self.emisora.on_cola_baja = self.director.rellenar
         self.emisora.on_tick = self.director.revisar_programa      # cambio de programa: tira lo que ya estaba en cola
         self.emisora.on_cambio = self._on_cambio
@@ -167,8 +168,19 @@ class Radio(commands.Cog):
     async def cog_load(self):
         self._refrescar.start()
         self._vigilante = asyncio.get_running_loop().create_task(self._vigilar_loop())
-        if C.SIEMPRE_AL_AIRE:
-            await self.emisora.iniciar()
+        # La emisora corre SIEMPRE (radio "virtual"): la programación avanza por reloj aunque nadie esté conectado.
+        asyncio.get_running_loop().create_task(self._arrancar_emisora())
+
+    async def _arrancar_emisora(self):
+        await self.bot.wait_until_ready()
+        await self.emisora.iniciar()
+
+    def _nodos_listos(self) -> bool:
+        """¿Hay algún nodo de Lavalink conectado? Si no, el Director pausa el armado (no gasta IA ni TTS)."""
+        try:
+            return bool(list(get_nodos_conectados()))
+        except Exception:
+            return True
 
     async def cog_unload(self):
         self._refrescar.cancel()
@@ -532,8 +544,6 @@ class Radio(commands.Cog):
                                                                color=discord.Color.from_rgb(*C.COLOR_EMBED)))
                 except Exception:
                     pass
-        if not self.sesiones and not C.SIEMPRE_AL_AIRE:
-            await self.emisora.detener()
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
@@ -554,6 +564,10 @@ class Radio(commands.Cog):
             t = self._vacio.pop(gid, None)
             if t:
                 t.cancel()
+            # entró una persona y el player no está sonando: ponerlo justo donde va la radio
+            if (not member.bot and after.channel == canal and before.channel != canal
+                    and not getattr(ses.vc, "playing", True)):
+                await self.emisora.resincronizar(gid)
 
     async def _salir_si_vacio(self, gid: int):
         try:

@@ -65,7 +65,9 @@ EXITOS_TTL_S = _num("RADIO_WEB_EXITOS_HORAS", 12) * 3600
 _mixin = None
 _cache = None                 # clave -> {"t": timestamp, "txt": str|None, "via": "conocimiento"|"web"}
 _pendientes = {}              # clave -> tarea en curso (si piden lo mismo a la vez, se comparte la búsqueda)
-_lock_disco = None
+_guardando = False            # hay un guardado en disco en curso
+_sucio = False                # llegaron datos nuevos mientras se guardaba: repetir el guardado al terminar
+_tareas_guardado = set()
 
 
 # ───────────────────────── Caché ─────────────────────────
@@ -97,14 +99,24 @@ def _escribir(datos: dict):
 
 
 async def _guardar():
-    global _lock_disco
-    if _lock_disco is None:
-        _lock_disco = asyncio.Lock()
-    async with _lock_disco:
-        try:
-            await asyncio.to_thread(_escribir, dict(_cache))
-        except Exception as e:
-            logger.debug(f"[radio] no pude guardar la caché web: {e!r}")
+    """Guarda en disco SIN hacer esperar a nadie (corre en segundo plano). Si el disco se cuelga, se rinde a los 10 s;
+    si ya hay un guardado en curso, solo lo marca para repetirlo al terminar."""
+    global _guardando, _sucio
+    if _guardando:
+        _sucio = True
+        return
+    _guardando = True
+    try:
+        while True:
+            _sucio = False
+            try:
+                await asyncio.wait_for(asyncio.to_thread(_escribir, dict(_cache)), timeout=10)
+            except Exception as e:
+                logger.warning(f"[radio] no pude guardar la caché web (se sigue sin guardar): {e!r}")
+            if not _sucio:
+                break
+    finally:
+        _guardando = False
 
 
 async def _poner(clave: str, entrada: dict):
@@ -115,7 +127,9 @@ async def _poner(clave: str, entrada: dict):
         sobran = len(c) - CACHE_MAX + max(1, CACHE_MAX // 10)
         for k, _ in sorted(c.items(), key=lambda kv: kv[1].get("t", 0))[:sobran]:
             c.pop(k, None)
-    await _guardar()
+    t = asyncio.ensure_future(_guardar())      # en segundo plano: buscar_info NO espera al disco
+    _tareas_guardado.add(t)
+    t.add_done_callback(_tareas_guardado.discard)
 
 
 def _leer(clave: str, ttl_dias: float = None):
