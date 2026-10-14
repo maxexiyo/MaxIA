@@ -85,26 +85,133 @@ class Music(commands.Cog):
         self._track_start = {}     # guild_id -> asyncio.Event que se activa cuando Lavalink confirma que la canción EMPEZÓ
         self._colores = {}         # url de portada -> (r, g, b) dominante, para el color de la barrita del embed
         self._aviso_carga = {}     # guild_id -> mensaje "Cargando canción" que luego se edita al embed de reproducción
+        self._resume_ms = {}       # guild_id -> (url, posición en ms, ¿en pausa?) para reanudar justo donde iba tras un reinicio
+
+    async def cog_load(self):
+        # Si el vigilante reinicia el bot, la música vuelve sola al canal y a la posición donde iba
+        try:
+            import vigilante
+            vigilante.registrar_estado('musica', self._estado_para_vigilante, self._restaurar_estado)
+        except Exception as e:
+            logger.info(f"Música: sin restauración tras reinicios del vigilante ({e!r})")
 
     async def cog_unload(self):
         detener_monitor()
+        try:
+            import vigilante
+            vigilante.quitar_estado('musica')
+        except Exception:
+            pass
+
+    # ───────────────────────── Reanudar tras un reinicio del vigilante ─────────────────────────
+    @staticmethod
+    def _track_a_json(track) -> dict:
+        req = track.get('requester')
+        req_id = req.id if isinstance(req, (discord.Member, discord.User)) else track.get('requester_id', 0)
+        return {
+            'title': track.get('title'),
+            'uploader': track.get('uploader'),
+            'duration': track.get('duration', 0),
+            'thumbnail': track.get('thumbnail'),
+            'url': track.get('url'),
+            'query': track.get('query', ''),
+            'requester_id': req_id,
+        }
+
+    def _estado_para_vigilante(self):
+        """Qué suena en cada servidor (canal de voz, canción actual con su posición, fila). El vigilante lo guarda cada
+        pocos segundos; tras un reinicio se usa para volver a entrar y seguir justo donde iba."""
+        sesiones = []
+        for vc in list(self.bot.voice_clients):
+            if not isinstance(vc, wavelink.Player) or not getattr(vc, 'channel', None):
+                continue
+            gid = vc.guild.id
+            if self._radio_activa(gid):          # en modo radio manda el cog Radio
+                continue
+            actual = self.current.get(gid)
+            cola = self.queues.get(gid) or []
+            if not actual and not cola:
+                continue
+            try:
+                posicion_ms = int(self._elapsed_seconds(gid, vc) * 1000) if actual else 0
+            except Exception:
+                posicion_ms = 0
+            canal_txt = self.text_channels.get(gid)
+            sesiones.append({
+                'guild_id': gid,
+                'voice_channel_id': vc.channel.id,
+                'text_channel_id': getattr(canal_txt, 'id', None),
+                'host_id': self.hosts.get(gid),
+                'actual': self._track_a_json(actual) if actual else None,
+                'posicion_ms': posicion_ms,
+                'pausado': bool(vc.is_paused()),
+                'cola': [self._track_a_json(t) for t in cola][:100],
+            })
+        return {'sesiones': sesiones} if sesiones else None
+
+    async def _restaurar_estado(self, datos):
+        """Tras un reinicio: reconecta al canal de voz, reconstruye la fila y reanuda la canción en su posición.
+        Idempotente: el vigilante la reintenta si algo falla, y los servidores ya restaurados se saltan."""
+        errores = []
+        for d in datos.get('sesiones', []):
+            gid = d['guild_id']
+            try:
+                guild = self.bot.get_guild(gid)
+                canal = guild.get_channel(d['voice_channel_id']) if guild else None
+                if canal is None:
+                    logger.warning(f"Música: no pude restaurar {gid}, ya no existe el canal de voz")
+                    continue
+                vc = guild.voice_client
+                if vc is not None and (self.is_active(gid, vc) or self.current.get(gid)):
+                    continue                                   # ya restaurado (reintento) o alguien ya puso música
+                if not [m for m in canal.members if not m.bot]:
+                    logger.info(f"Música: {guild.name} / {canal.name} quedó sin oyentes durante el reinicio; no restauro")
+                    continue
+                if self._radio_activa(gid):
+                    continue
+
+                if vc is None:
+                    if not await self.get_nodo_conectado_con_reintento():
+                        raise RuntimeError("ningún nodo de Lavalink disponible todavía")
+                    await conectar_player(canal)
+                elif vc.channel != canal:
+                    await vc.move_to(canal)
+
+                cola = []
+                items = ([d['actual']] if d.get('actual') else []) + list(d.get('cola') or [])
+                for item in items:
+                    item = dict(item)
+                    item['requester'] = guild.get_member(item.get('requester_id', 0)) or guild.me
+                    cola.append(item)
+                if not cola:
+                    continue
+                self.queues[gid] = cola
+                if d.get('actual'):
+                    self._resume_ms[gid] = (d['actual'].get('url'), int(d.get('posicion_ms') or 0), bool(d.get('pausado')))
+                host = d.get('host_id')
+                if host and guild.get_member(host):
+                    self.hosts[gid] = host
+                canal_txt = guild.get_channel(d.get('text_channel_id') or 0) or canal
+                self.text_channels[gid] = canal_txt
+                ctx = self._CtxLike(guild, canal_txt, guild.voice_client)
+                try:
+                    await canal_txt.send("🔄 Me reinicié por una falla técnica, ya regresé con la música.", silent=True)
+                except Exception:
+                    pass
+                await self.play_next(ctx)
+                logger.info(f"Música restaurada en {guild.name} / {canal.name} ({len(cola)} canciones)")
+            except Exception as e:
+                logger.warning(f"Música: no pude restaurar el servidor {gid}: {type(e).__name__}: {e}")
+                errores.append(e)
+        if errores:
+            raise errores[0]          # el vigilante reintenta; los servidores ya restaurados se saltan
 
     def save_queue_to_db(self, guild_id: int):
         """Guarda la cola actual del servidor en la BD en formato JSON"""
         try:
             queue_data = []
             for track in self.queues.get(guild_id, []):
-                req = track.get('requester')
-                req_id = req.id if isinstance(req, (discord.Member, discord.User)) else track.get('requester_id', 0)
-                queue_data.append({
-                    'title': track.get('title'),
-                    'uploader': track.get('uploader'),
-                    'duration': track.get('duration', 0),
-                    'thumbnail': track.get('thumbnail'),
-                    'url': track.get('url'),
-                    'query': track.get('query', ''),
-                    'requester_id': req_id
-                })
+                queue_data.append(self._track_a_json(track))
             db.set_config(guild_id, 'music_session_queue', json.dumps(queue_data))
         except Exception as e:
             logger.error(f"Error al guardar cola en DB: {e}")
@@ -484,6 +591,14 @@ class Music(commands.Cog):
                 self._advancing.discard(guild_id)
 
     async def _safe_send(self, ctx, *args, **kwargs):
+        # Con la radio al aire en el servidor, los avisos de la música ("ya no hay más en la fila", "no pude reproducir...")
+        # no van al chat: ahí manda el cog Radio.
+        try:
+            if self._radio_activa(ctx.guild.id):
+                logger.debug(f"Aviso de música omitido (radio al aire en guild {ctx.guild.id}): {str(args[0])[:60] if args else ''}")
+                return None
+        except Exception:
+            pass
         try:
             return await ctx.send(*args, **kwargs)
         except Exception as e:
@@ -622,6 +737,13 @@ class Music(commands.Cog):
         if vc is None:
             raise _SinCanalDeVoz()
 
+        # ⏩ Tras un reinicio del vigilante: la canción que sonaba se reanuda en su posición (solo si es esa canción)
+        resume = self._resume_ms.get(guild_id)
+        if resume and resume[0] != track.get('url'):
+            self._resume_ms.pop(guild_id, None)
+            resume = None
+        start_ms, pausado = (resume[1], resume[2]) if resume else (0, False)
+
         # 🎨 El color de la portada se saca en paralelo mientras carga la canción
         tarea_color = asyncio.create_task(self._cargar_color(track.get('thumbnail')))
 
@@ -659,7 +781,7 @@ class Music(commands.Cog):
         inicio = asyncio.Event()
         self._track_start[guild_id] = inicio
         try:
-            await self._play_en_player(vc, wl_track, nodo)
+            await self._play_en_player(vc, wl_track, nodo, start_ms, pausado)
             # play() solo significa "Lavalink aceptó la orden". La canción realmente empezó cuando llega
             # el evento TrackStart; mientras tanto se sigue mostrando el aviso de "cargando".
             try:
@@ -669,12 +791,13 @@ class Music(commands.Cog):
                 raise RuntimeError(f"La canción no arrancó en el nodo (nodo lento o con problemas).")
         finally:
             self._track_start.pop(guild_id, None)
+        self._resume_ms.pop(guild_id, None)       # ya arrancó: la reanudación se cumplió
 
         # ── A partir de aquí la canción YA está sonando; que falle el mensaje no debe reintentar ──
         self.start_times[guild_id] = time.time()
-        self._pos_ref[guild_id] = {'obs': 0, 'pos': 0, 'wall': time.monotonic()}
+        self._pos_ref[guild_id] = {'obs': start_ms, 'pos': start_ms, 'wall': time.monotonic()}
 
-        bar_text = self.generate_progress_bar(0, track.get('duration', 0))
+        bar_text = self.generate_progress_bar(start_ms / 1000, track.get('duration', 0))
         queue_len = len(self.queues.get(guild_id, []))
         try:
             await asyncio.wait_for(asyncio.shield(tarea_color), timeout=3)
@@ -752,7 +875,7 @@ class Music(commands.Cog):
         except Exception as e:
             logger.debug(f"No se pudo precargar la siguiente canción: {e}")
 
-    async def _play_en_player(self, vc, wl_track, nodo_origen):
+    async def _play_en_player(self, vc, wl_track, nodo_origen, start_ms: int = 0, pausado: bool = False):
         """vc.play() con timeout, y un reintento en otro nodo si el del player falla/se cuelga."""
         # Si el track lo resolvió OTRO nodo (el del player falló), movemos el player a ese nodo
         if nodo_origen is not None and vc.node != nodo_origen and nodo_origen.status == wavelink.NodeStatus.CONNECTED:
@@ -764,7 +887,7 @@ class Music(commands.Cog):
         async def _play():
             try:
                 # paused=False: Wavelink arranca la canción nueva PAUSADA si el player estaba en pausa
-                await asyncio.wait_for(vc.play(wl_track, paused=False), timeout=PLAY_TIMEOUT)
+                await asyncio.wait_for(vc.play(wl_track, start=start_ms, paused=pausado), timeout=PLAY_TIMEOUT)
             except asyncio.TimeoutError:
                 raise RuntimeError("Lavalink tardó demasiado en responder (nodo lento o caído).")
 
@@ -826,7 +949,8 @@ class Music(commands.Cog):
             gid = player.guild.id
             self._confirmado.add(gid)
             self._stall.pop(gid, None)
-            self._pos_ref[gid] = {'obs': 0, 'pos': 0, 'wall': time.monotonic()}
+            base = (self._resume_ms.get(gid) or (None, 0))[1]      # 0, o la posición si se está reanudando tras un reinicio
+            self._pos_ref[gid] = {'obs': base, 'pos': base, 'wall': time.monotonic()}
             ev = self._track_start.get(gid)
             if ev:
                 ev.set()
@@ -1055,6 +1179,8 @@ class Music(commands.Cog):
         if not player or not player.guild:
             return
         guild_id = player.guild.id
+        if self._radio_activa(guild_id):      # en modo radio, el que maneja las trabas es el cog Radio
+            return
         channel = self.text_channels.get(guild_id) or getattr(player, 'channel', None)
         logger.debug(f"TrackStuck en guild {guild_id}.")
         track = getattr(payload, 'track', None)
@@ -1079,6 +1205,8 @@ class Music(commands.Cog):
                 continue
 
             guild_id = player.guild.id
+            if self._radio_activa(guild_id):  # en modo radio, el cog Radio cambia de nodo por su cuenta (y sin avisos de música)
+                continue
             channel = self.text_channels.get(guild_id) or getattr(player, 'channel', None)
 
             # 📌 Guardamos canción y posición ANTES de mover el player (después pueden resetearse)

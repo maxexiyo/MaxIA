@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from array import array
 from collections import deque
 from pathlib import Path
@@ -40,44 +41,61 @@ def _load_gemini_keys():
 
 
 GEMINI_KEYS = _load_gemini_keys()
-# gemini-3.8-flash-lite-tts = rápido (recomendado). gemini-3.8-flash-tts = más expresivo pero más lento.
-# Requiere: pip install -U google-genai (>= 2.25.0)
+
+# ---- Modelos de Gemini TTS, en orden de prioridad ----
+# Cada modelo tiene SU PROPIA cuota, así que cuando uno se agota el bot pasa al siguiente.
+# Si todos fallan, cae a edge-tts como siempre.
+# OJO: revisa con !ttsmodelos que los IDs existan para tu key (los de 3.1 y 2.5 pueden cambiar de nombre).
 GEMINI_TTS_MODEL = os.getenv('GEMINI_TTS_MODEL', 'gemini-3.8-flash-lite-tts')
-GEMINI_TTS_VOICE = os.getenv('GEMINI_TTS_VOICE', 'Kore')
-# Motor por defecto: gemini si hay API key, si no edge
+_FALLBACKS = os.getenv(
+    'GEMINI_TTS_FALLBACKS',
+    'gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts'
+)
+GEMINI_MODELS = []
+for _m in [GEMINI_TTS_MODEL] + _FALLBACKS.split(','):
+    _m = _m.strip()
+    if _m and _m not in GEMINI_MODELS:
+        GEMINI_MODELS.append(_m)
+
+GEMINI_TTS_VOICE = os.getenv('GEMINI_TTS_VOICE', 'Kore')   # la misma voz en todos los modelos
+
+# Motor por defecto: gemini si hay API key, si no edge.
 DEFAULT_ENGINE = 'gemini' if GEMINI_KEYS else 'edge'
-# Estilo opcional corto (ej: 'casual, friendly'). Vacío = más rápido y es lo que recomienda Google.
+# Estilo opcional corto. Se aplica igual en todos los modelos.
 GEMINI_STYLE = os.getenv('GEMINI_TTS_STYLE', 'estilo mexicano, con entonacion, mete emocion')
 CHUNK_CHARS = 160          # (solo sin streaming) mensajes más largos se parten en pedazos
 
-# Streaming: el audio empieza a sonar mientras Gemini lo genera (solo modelos gemini-3.8-*).
+# Streaming: el audio empieza a sonar mientras Gemini lo genera.
+# Los modelos 3.8 hacen streaming real; los demás (3.1 / 2.5) generan todo y luego se manda de una al reproductor.
 # Para apagarlo: export GEMINI_TTS_STREAM=0
 GEMINI_STREAM = os.getenv('GEMINI_TTS_STREAM', '1') != '0'
-USE_STREAM = GEMINI_STREAM and GEMINI_TTS_MODEL.startswith('gemini-3.8')
+USE_STREAM = GEMINI_STREAM
 PREBUFFER_SECS = 0.35      # cuánto audio junta antes de empezar a sonar (evita cortes al inicio)
 
-# Anti "too many requests" (429)
+# Anti "too many requests" (429). Ahora todo se lleva POR (key, modelo).
 GEMINI_CONCURRENCY = int(os.getenv('GEMINI_TTS_CONCURRENCY', '2'))   # streams a Gemini al mismo tiempo
-KEY_COOLDOWN = float(os.getenv('GEMINI_TTS_COOLDOWN', '30'))         # segundos que "descansa" una key tras un 429
-# Cupo LOCAL por key: el bot se frena SOLO antes de que Google responda 429 (los mensajes que no caben
-# se leen con edge-tts). Ajústalo a lo que diga tu página de límites en AI Studio.
-# El plan gratis de los modelos TTS es MUY bajo (en el modelo 2.5 TTS eran 3 por minuto y 15 por día).
-GEMINI_RPM_PER_KEY = int(os.getenv('GEMINI_TTS_RPM', '3'))        # peticiones por minuto por key (0 = sin límite)
-GEMINI_DAILY_PER_KEY = int(os.getenv('GEMINI_TTS_DAILY', '0'))    # peticiones por día por key (0 = sin límite)
+KEY_COOLDOWN = float(os.getenv('GEMINI_TTS_COOLDOWN', '30'))         # segundos que "descansa" una combinación key+modelo tras un 429
+# Cupo LOCAL por key y por modelo (0 = sin límite). Con el plan gratis de TTS: RPM=3 y DAILY=10.
+GEMINI_RPM_PER_KEY = int(os.getenv('GEMINI_TTS_RPM', '0'))
+GEMINI_DAILY_PER_KEY = int(os.getenv('GEMINI_TTS_DAILY', '0'))
 # Si Gemini no manda NADA de audio en este tiempo, se usa edge-tts para ese mensaje (en vez de quedarse mudo)
+# (con varios modelos de respaldo conviene subirlo un poco: GEMINI_TTS_FIRST_AUDIO_TIMEOUT=12)
 GEMINI_FIRST_AUDIO_TIMEOUT = float(os.getenv('GEMINI_TTS_FIRST_AUDIO_TIMEOUT', '10'))
 # Si todos los lugares de Gemini están ocupados, espera máximo esto y se va directo a edge-tts
 GEMINI_SLOT_WAIT = float(os.getenv('GEMINI_TTS_SLOT_WAIT', '3'))
-GEMINI_HTTP_TIMEOUT_MS = 40000   # corta peticiones colgadas a nivel de red
+GEMINI_HTTP_TIMEOUT_MS = 15000   # corta peticiones colgadas a nivel de red (así el hilo termina solo y no se acumulan)
+# Pool PROPIO para Gemini: si Gemini se cuelga, solo se llenan estos hilos y NO el pool por defecto (DNS, aiohttp, etc.)
+GEMINI_POOL = ThreadPoolExecutor(max_workers=int(os.getenv('GEMINI_TTS_POOL', '6')), thread_name_prefix='gemini-tts')
+# Tope por combinación key+modelo en _gemini_tts (la que usa la radio): si una key no responde en este tiempo, descansa y se pasa a la
+# siguiente. Sin esto una key colgada se come todo el timeout de quien llama y las demás keys nunca se prueban.
+GEMINI_ATTEMPT_TIMEOUT = float(os.getenv('GEMINI_TTS_ATTEMPT_TIMEOUT', '12'))
 
-# ✅ FIX: antes SYNTH_TIMEOUT era 5s, MENOR que el tiempo que Gemini puede tardar antes de rendirse (10s).
-# El worker cancelaba la tarea a los 5s y edge-tts NUNCA llegaba a ejecutarse (el bot se quedaba mudo).
-# Ahora el timeout total siempre es mayor que: espera de lugar + primer audio de Gemini + edge-tts.
+# El timeout total siempre es mayor que: espera de lugar + primer audio de Gemini + edge-tts.
 SYNTH_TIMEOUT = float(os.getenv(
     'TTS_SYNTH_TIMEOUT', str(GEMINI_SLOT_WAIT + GEMINI_FIRST_AUDIO_TIMEOUT + EDGE_TIMEOUT + 2)
 ))
 
-# Formato del audio que devuelve Gemini en streaming: PCM 16-bit, 24 kHz, mono
+# Formato del audio que devuelve Gemini: PCM 16-bit, 24 kHz, mono (en todos los modelos TTS)
 SRC_BYTES_PER_SEC = 24000 * 2
 PREBUFFER_BYTES = int(SRC_BYTES_PER_SEC * PREBUFFER_SECS)
 FRAME_IN = 960             # 20 ms de audio de Gemini (24kHz mono 16-bit = 480 muestras)
@@ -141,7 +159,7 @@ def split_chunks(text: str, limit: int = CHUNK_CHARS):
 
 
 class GeminiNoCapacity(RuntimeError):
-    """No hay ninguna key de Gemini disponible ahora mismo (descansando o sin cupo local)."""
+    """No hay ninguna combinación key+modelo disponible ahora mismo (descansando o sin cupo local)."""
 
 
 def _is_rate_limit(e: Exception) -> bool:
@@ -152,17 +170,32 @@ def _is_rate_limit(e: Exception) -> bool:
     return '429' in t or 'resource_exhausted' in t or 'too many' in t or 'quota' in t
 
 
-def _tts_request(text: str) -> dict:
+def _is_interactions_model(model: str) -> bool:
+    """Los modelos 3.8 usan la Interactions API (con streaming). Los demás usan generate_content."""
+    return model.startswith('gemini-3.8')
+
+
+def _tts_request(text: str, model: str) -> dict:
     """Parámetros de la petición a Gemini 3.8 TTS (Interactions API)."""
     content = {'type': 'text', 'text': text}
     if GEMINI_STYLE:
         content['annotations'] = [{'type': 'speech_metadata', 'style': GEMINI_STYLE}]
     return dict(
-        model=GEMINI_TTS_MODEL,
+        model=model,
         input=[{'type': 'user_input', 'content': [content]}],
         response_format={'type': 'audio'},
         generation_config={'speech_config': [{'voice': GEMINI_TTS_VOICE}]},
     )
+
+
+def _pcm_to_wav(pcm: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, 'wb') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+    return buf.getvalue()
 
 
 def _upsample(raw: bytes) -> bytes:
@@ -198,7 +231,7 @@ class PCMStreamSource(discord.AudioSource):
         self.cancelled = False
         self.error = None
         self.total_bytes = 0
-        self.key_idx = None               # key que se está usando (para el descanso si se cuelga)
+        self.combo = None                 # (idx de key, modelo) que se está usando (para el descanso si se cuelga)
         self.slot_released = False        # ¿ya se liberó su lugar en el semáforo?
         self.ready = asyncio.Event()      # ya hay suficiente audio para empezar (o terminó / falló)
         self.done = threading.Event()     # terminó la generación
@@ -263,23 +296,37 @@ class PCMStreamSource(discord.AudioSource):
 
 
 class TTS(commands.Cog):
-    """Cog de text-to-speech: Gemini TTS (con streaming) por defecto, con respaldo a edge-tts"""
+    """Cog de text-to-speech: Gemini TTS (con cadena de modelos de respaldo) -> edge-tts"""
 
     def __init__(self, bot):
         self.bot = bot
         self.vc_readers = {}
         self._gemini_clients = {}   # key -> cliente
         self._gemini_idx = 0        # rotación pegajosa: se queda en la key que funciona
-        self._key_cooldown = {}     # idx de key -> momento hasta el que descansa (por 429)
-        self._key_streak = {}       # idx de key -> 429 seguidos (el descanso crece si se repite)
-        self._key_calls = {}        # idx de key -> deque con la hora de sus últimas peticiones
+        # Todo esto va por combo = (idx de key, modelo), para que un 429 en un modelo no bloquee a los demás
+        self._key_cooldown = {}     # combo -> momento hasta el que descansa (por 429)
+        self._key_streak = {}       # combo -> 429 seguidos (el descanso crece si se repite)
+        self._key_calls = {}        # combo -> deque con la hora de sus últimas peticiones
         self._budget_lock = threading.Lock()
         self._gemini_sem = asyncio.Semaphore(GEMINI_CONCURRENCY)   # FIFO: respeta el orden de los mensajes
         # limpiar audios huérfanos de ejecuciones anteriores
         for old in TTS_FOLDER.glob('tts_*'):
             old.unlink(missing_ok=True)
 
+    async def cog_load(self):
+        # Si el vigilante reinicia el bot, el lector de voz vuelve a conectarse solo
+        try:
+            import vigilante
+            vigilante.registrar_estado('tts', self._estado_para_vigilante, self._restaurar_estado)
+        except Exception as e:
+            logger.info(f'TTS: sin restauración tras reinicios del vigilante ({e!r})')
+
     def cog_unload(self):
+        try:
+            import vigilante
+            vigilante.quitar_estado('tts')
+        except Exception:
+            pass
         for data in self.vc_readers.values():
             task = data.get('task')
             if task:
@@ -297,9 +344,9 @@ class TTS(commands.Cog):
             self._gemini_clients[key] = client
         return client
 
-    def _budget_ok_locked(self, idx: int, now: float) -> bool:
-        """¿La key todavía tiene cupo local (por minuto / por día)? Llamar con _budget_lock tomado."""
-        dq = self._key_calls.setdefault(idx, deque())
+    def _budget_ok_locked(self, combo, now: float) -> bool:
+        """¿La combinación key+modelo todavía tiene cupo local (por minuto / por día)? Llamar con _budget_lock tomado."""
+        dq = self._key_calls.setdefault(combo, deque())
         horizonte = 86400 if GEMINI_DAILY_PER_KEY else 60
         while dq and now - dq[0] > horizonte:
             dq.popleft()
@@ -309,44 +356,44 @@ class TTS(commands.Cog):
             return False
         return True
 
-    def _reserve(self, idx: int) -> bool:
+    def _reserve(self, combo) -> bool:
         """Si hay cupo, apunta la petición y devuelve True."""
         now = time.time()
         with self._budget_lock:
-            if not self._budget_ok_locked(idx, now):
+            if not self._budget_ok_locked(combo, now):
                 return False
-            self._key_calls[idx].append(now)
+            self._key_calls[combo].append(now)
             return True
 
-    def _available_keys(self):
-        """Índices de keys que NO están descansando y todavía tienen cupo local,
-        empezando por la que funcionó la última vez."""
+    def _available_combos(self):
+        """Lista de (idx_key, modelo) que NO están descansando y todavía tienen cupo local.
+        Orden: primero el modelo principal con todas sus keys, luego los modelos de respaldo."""
         now_m = time.monotonic()
         now_w = time.time()
         total = len(GEMINI_KEYS)
         if not total:
             return []
         orden = [(self._gemini_idx + i) % total for i in range(total)]
-        libres = [i for i in orden if self._key_cooldown.get(i, 0) <= now_m]
+        libres = [(i, m) for m in GEMINI_MODELS for i in orden if self._key_cooldown.get((i, m), 0) <= now_m]
         with self._budget_lock:
-            return [i for i in libres if self._budget_ok_locked(i, now_w)]
+            return [c for c in libres if self._budget_ok_locked(c, now_w)]
 
-    def _mark_success(self, idx: int):
-        self._gemini_idx = idx
-        self._key_streak[idx] = 0
+    def _mark_success(self, combo):
+        self._gemini_idx = combo[0]
+        self._key_streak[combo] = 0
 
-    def _mark_failure(self, idx: int, e: Exception):
+    def _mark_failure(self, combo, e: Exception):
         if not _is_rate_limit(e):
             return
         # El descanso se duplica con cada 429 seguido (30s, 60s, 2min... hasta 1h) y se reinicia al funcionar
-        racha = self._key_streak.get(idx, 0) + 1
-        self._key_streak[idx] = racha
+        racha = self._key_streak.get(combo, 0) + 1
+        self._key_streak[combo] = racha
         descanso = min(KEY_COOLDOWN * (2 ** (racha - 1)), 3600)
         msg = str(e).lower()
         if 'perday' in msg or 'per day' in msg or 'daily' in msg:
             descanso = max(descanso, 3600)   # cuota del día agotada: no tiene caso insistir cada rato
-        self._key_cooldown[idx] = time.monotonic() + descanso
-        logger.warning(f'Key #{idx + 1} llegó al límite de peticiones: descansa {descanso:.0f}s')
+        self._key_cooldown[combo] = time.monotonic() + descanso
+        logger.warning(f'Key #{combo[0] + 1} / {combo[1]} llegó al límite de peticiones: descansa {descanso:.0f}s')
 
     async def _acquire_slot(self):
         """Toma un lugar del semáforo, pero NO espera para siempre: si no hay lugar en
@@ -357,7 +404,7 @@ class TTS(commands.Cog):
             raise GeminiNoCapacity('Gemini ocupado (sin lugar libre a tiempo)')
 
     def _stream_worker(self, text: str, source: PCMStreamSource):
-        """Corre en un hilo: pide el audio a Gemini en streaming y lo mete en `source` conforme llega."""
+        """Corre en un hilo: pide el audio a Gemini y lo mete en `source` conforme llega."""
         try:
             self._run_stream(text, source)
         finally:
@@ -373,72 +420,103 @@ class TTS(commands.Cog):
             source.slot_released = True
             self._gemini_sem.release()
 
+    def _stream_interactions(self, client, model: str, text: str, source: PCMStreamSource):
+        """Modelos 3.8: streaming real con la Interactions API."""
+        if not hasattr(client, 'interactions'):
+            raise RuntimeError('google-genai muy viejo, actualiza con: pip install -U google-genai')
+
+        stream = client.interactions.create(**_tts_request(text, model), stream=True)
+        for event in stream:
+            if source.cancelled:
+                break
+            if getattr(event, 'event_type', None) != 'step.delta':
+                continue
+            delta = getattr(event, 'delta', None)
+            if delta is None or getattr(delta, 'type', None) != 'audio':
+                continue
+            data = getattr(delta, 'data', None)
+            if data:
+                source.feed(base64.b64decode(data))
+
+    def _legacy_pcm(self, client, model: str, text: str) -> bytes:
+        """Modelos 3.1 / 2.5: generate_content normal (sin streaming). Devuelve PCM 24kHz mono crudo.
+        El estilo va como instrucción antes de los dos puntos ("estilo: texto")."""
+        from google.genai import types
+
+        response = client.models.generate_content(
+            model=model,
+            contents=f'{GEMINI_STYLE}: {text}' if GEMINI_STYLE else text,
+            config=types.GenerateContentConfig(
+                response_modalities=['AUDIO'],
+                speech_config=types.SpeechConfig(
+                    voice_config=types.VoiceConfig(
+                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_TTS_VOICE)
+                    )
+                ),
+            ),
+        )
+        return response.candidates[0].content.parts[0].inline_data.data
+
     def _run_stream(self, text: str, source: PCMStreamSource):
-        candidatas = self._available_keys()
+        candidatas = self._available_combos()
         if not candidatas:
-            source.finish(error=GeminiNoCapacity('Sin keys disponibles (descansando o sin cupo)'))
+            source.finish(error=GeminiNoCapacity('Sin keys/modelos disponibles (descansando o sin cupo)'))
             return
 
         total = len(GEMINI_KEYS)
         last_error = None
-        for idx in candidatas:
+        for combo in candidatas:
+            idx, model = combo
             if source.cancelled:
                 break
-            if not self._reserve(idx):
+            if not self._reserve(combo):
                 continue          # se acabó su cupo local justo ahora
             try:
-                source.key_idx = idx
+                source.combo = combo
                 client = self._get_client(GEMINI_KEYS[idx])
-                if not hasattr(client, 'interactions'):
-                    raise RuntimeError('google-genai muy viejo, actualiza con: pip install -U google-genai')
 
-                stream = client.interactions.create(**_tts_request(text), stream=True)
-                for event in stream:
-                    if source.cancelled:
-                        break
-                    if getattr(event, 'event_type', None) != 'step.delta':
-                        continue
-                    delta = getattr(event, 'delta', None)
-                    if delta is None or getattr(delta, 'type', None) != 'audio':
-                        continue
-                    data = getattr(delta, 'data', None)
-                    if data:
-                        source.feed(base64.b64decode(data))
+                if _is_interactions_model(model):
+                    self._stream_interactions(client, model, text, source)
+                else:
+                    # sin streaming: se genera todo y se mete de una al reproductor
+                    pcm = self._legacy_pcm(client, model, text)
+                    if not source.cancelled:
+                        source.feed(pcm)
 
                 if source.cancelled:
                     source.finish()
                     return
                 if source.total_bytes == 0:
                     raise RuntimeError('Gemini no devolvió audio')
-                self._mark_success(idx)
+                self._mark_success(combo)
                 source.finish()
                 return
             except Exception as e:
                 last_error = e
-                logger.warning(f'Gemini TTS (stream) key #{idx + 1}/{total} falló ({type(e).__name__}: {e})')
-                self._mark_failure(idx, e)
+                logger.warning(f'Gemini TTS key #{idx + 1}/{total} modelo {model} falló ({type(e).__name__}: {e})')
+                self._mark_failure(combo, e)
                 if source.total_bytes > 0:
-                    # ya se mandó audio parcial: no se puede reintentar con otra key sin duplicarlo
+                    # ya se mandó audio parcial: no se puede reintentar con otro modelo sin duplicarlo
                     source.finish(error=e)
                     return
 
         if source.cancelled:
             source.finish()
         else:
-            source.finish(error=last_error or GeminiNoCapacity('Sin keys disponibles (sin cupo)'))
+            source.finish(error=last_error or GeminiNoCapacity('Sin keys/modelos disponibles (sin cupo)'))
 
     async def _gemini_stream(self, text: str) -> PCMStreamSource:
-        """Arranca el streaming y regresa en cuanto hay suficiente audio para empezar a sonar.
-        Solo hay GEMINI_CONCURRENCY streams a la vez, en el mismo orden que los mensajes (evita los 429).
+        """Arranca la generación y regresa en cuanto hay suficiente audio para empezar a sonar.
+        Solo hay GEMINI_CONCURRENCY peticiones a la vez, en el mismo orden que los mensajes (evita los 429).
         Si Gemini no manda audio a tiempo, lanza error para que se use edge-tts."""
-        if not self._available_keys():
-            raise GeminiNoCapacity('Sin keys disponibles (descansando o sin cupo)')
+        if not self._available_combos():
+            raise GeminiNoCapacity('Sin keys/modelos disponibles (descansando o sin cupo)')
 
         loop = asyncio.get_running_loop()
         await self._acquire_slot()                # espera su turno, pero con límite de tiempo
         source = PCMStreamSource(loop)
         try:
-            loop.run_in_executor(None, self._stream_worker, text, source)
+            loop.run_in_executor(GEMINI_POOL, self._stream_worker, text, source)
         except Exception:
             self._release_slot(source)
             raise
@@ -446,13 +524,13 @@ class TTS(commands.Cog):
         try:
             await asyncio.wait_for(source.ready.wait(), timeout=GEMINI_FIRST_AUDIO_TIMEOUT)
         except asyncio.TimeoutError:
-            # Gemini no mandó nada a tiempo: se suelta el lugar y esa key descansa un rato
+            # Gemini no mandó nada a tiempo: se suelta el lugar y esa combinación descansa un rato
             source.cancel()
             self._release_slot(source)
-            if source.key_idx is not None:
-                self._key_cooldown[source.key_idx] = time.monotonic() + KEY_COOLDOWN
-                logger.warning(f'Key #{source.key_idx + 1} no dio audio en {GEMINI_FIRST_AUDIO_TIMEOUT:.0f}s: '
-                               f'descansa {KEY_COOLDOWN:.0f}s')
+            if source.combo is not None:
+                self._key_cooldown[source.combo] = time.monotonic() + KEY_COOLDOWN
+                logger.warning(f'Key #{source.combo[0] + 1} / {source.combo[1]} no dio audio en '
+                               f'{GEMINI_FIRST_AUDIO_TIMEOUT:.0f}s: descansa {KEY_COOLDOWN:.0f}s')
             raise RuntimeError(f'Gemini no dio audio en {GEMINI_FIRST_AUDIO_TIMEOUT:.0f}s')
         except asyncio.CancelledError:
             source.cancel()
@@ -464,70 +542,53 @@ class TTS(commands.Cog):
             raise source.error or RuntimeError('Gemini no devolvió audio')
         return source
 
-    def _gemini_call_38(self, client, text: str) -> bytes:
+    def _gemini_call_38(self, client, model: str, text: str) -> bytes:
         """Gemini 3.8 TTS sin streaming (Interactions API). Síncrono, se corre en un hilo. Devuelve WAV."""
         if not hasattr(client, 'interactions'):
             raise RuntimeError('google-genai muy viejo, actualiza con: pip install -U google-genai')
-        interaction = client.interactions.create(**_tts_request(text))
+        interaction = client.interactions.create(**_tts_request(text, model))
         return base64.b64decode(interaction.output_audio.data)  # ya trae header WAV
 
-    async def _gemini_call_legacy(self, client, text: str) -> bytes:
-        """Modelos viejos (2.5 / 3.1 preview): devuelven PCM crudo, hay que envolverlo en WAV."""
-        from google.genai import types
-
-        response = await client.aio.models.generate_content(
-            model=GEMINI_TTS_MODEL,
-            contents=(GEMINI_STYLE + ' ' + text) if GEMINI_STYLE else text,
-            config=types.GenerateContentConfig(
-                response_modalities=['AUDIO'],
-                speech_config=types.SpeechConfig(
-                    voice_config=types.VoiceConfig(
-                        prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_TTS_VOICE)
-                    )
-                ),
-            ),
-        )
-        pcm = response.candidates[0].content.parts[0].inline_data.data
-        buf = io.BytesIO()
-        with wave.open(buf, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(24000)
-            wf.writeframes(pcm)
-        return buf.getvalue()
-
     async def _gemini_tts(self, text: str, file_path: Path):
-        """Genera el audio COMPLETO a un archivo (sin streaming), rotando keys si falla."""
-        candidatas = self._available_keys()
+        """Genera el audio COMPLETO a un archivo (sin streaming), probando keys y modelos en orden."""
+        candidatas = self._available_combos()
         if not candidatas:
-            raise GeminiNoCapacity('Sin keys disponibles (descansando o sin cupo)')
+            raise GeminiNoCapacity('Sin keys/modelos disponibles (descansando o sin cupo)')
 
         total = len(GEMINI_KEYS)
         last_error = None
         await self._acquire_slot()
         try:
-            for idx in candidatas:
-                if not self._reserve(idx):
+            for combo in candidatas:
+                idx, model = combo
+                if not self._reserve(combo):
                     continue
                 try:
                     client = self._get_client(GEMINI_KEYS[idx])
 
-                    if GEMINI_TTS_MODEL.startswith('gemini-3.8'):
-                        audio = await asyncio.to_thread(self._gemini_call_38, client, text)
+                    loop = asyncio.get_running_loop()
+                    if _is_interactions_model(model):
+                        audio = await asyncio.wait_for(loop.run_in_executor(GEMINI_POOL, self._gemini_call_38, client, model, text),
+                                                       timeout=GEMINI_ATTEMPT_TIMEOUT)
                     else:
-                        audio = await self._gemini_call_legacy(client, text)
+                        pcm = await asyncio.wait_for(loop.run_in_executor(GEMINI_POOL, self._legacy_pcm, client, model, text),
+                                                     timeout=GEMINI_ATTEMPT_TIMEOUT)
+                        audio = _pcm_to_wav(pcm)
 
                     file_path.write_bytes(audio)
-                    self._mark_success(idx)
+                    self._mark_success(combo)
                     return
                 except Exception as e:
                     last_error = e
-                    logger.warning(f'Gemini TTS key #{idx + 1}/{total} falló ({type(e).__name__}: {e})')
-                    self._mark_failure(idx, e)
+                    logger.warning(f'Gemini TTS key #{idx + 1}/{total} modelo {model} falló ({type(e).__name__}: {e})')
+                    if isinstance(e, asyncio.TimeoutError):   # no respondió a tiempo: descansa y se prueba la siguiente key
+                        self._key_cooldown[combo] = time.monotonic() + KEY_COOLDOWN
+                    else:
+                        self._mark_failure(combo, e)
         finally:
             self._gemini_sem.release()
 
-        raise last_error or GeminiNoCapacity('Sin keys disponibles (sin cupo)')
+        raise last_error or GeminiNoCapacity('Sin keys/modelos disponibles (sin cupo)')
 
     async def _edge_tts(self, text: str, voice: str, file_path: Path) -> bool:
         """Respaldo final: edge-tts (sin API key). Devuelve True si el archivo quedó listo."""
@@ -550,14 +611,18 @@ class TTS(commands.Cog):
         return False
 
     async def _synthesize(self, text: str, voice: str, engine: str, file_path: Path):
-        """Devuelve un PCMStreamSource (Gemini en streaming), un Path (archivo listo) o None si todo falló.
-        Si Gemini falla (cuota, error, timeout, sin cupo), cae SIEMPRE a edge-tts."""
+        """Devuelve un PCMStreamSource (Gemini), un Path (archivo listo) o None si todo falló.
+        Orden: Gemini (todos los modelos) -> edge-tts. Cada uno cae al siguiente si falla."""
+        if engine not in ('gemini', 'edge'):    # p. ej. 'chatterbox' guardado de antes
+            engine = DEFAULT_ENGINE
+
         if engine == 'gemini' and GEMINI_KEYS:
             try:
                 t0 = time.monotonic()
                 if USE_STREAM:
                     source = await self._gemini_stream(text)
-                    logger.info(f'Gemini streaming: primer audio en {time.monotonic() - t0:.1f}s ({len(text)} chars)')
+                    modelo = source.combo[1] if source.combo else '?'
+                    logger.info(f'Gemini ({modelo}): primer audio en {time.monotonic() - t0:.1f}s ({len(text)} chars)')
                     return source
                 await self._gemini_tts(text, file_path)
                 logger.info(f'Gemini: {len(text)} chars en {time.monotonic() - t0:.1f}s')
@@ -591,10 +656,11 @@ class TTS(commands.Cog):
                         synth_task.cancel()
                         continue
 
+                    espera = SYNTH_TIMEOUT
                     try:
-                        result = await asyncio.wait_for(synth_task, timeout=SYNTH_TIMEOUT)
+                        result = await asyncio.wait_for(synth_task, timeout=espera)
                     except asyncio.TimeoutError:
-                        logger.warning(f'Timeout ({SYNTH_TIMEOUT:.0f}s) generando {file_path.name}. Saltando.')
+                        logger.warning(f'Timeout ({espera:.0f}s) generando {file_path.name}. Saltando.')
                         continue
 
                     if result is None:
@@ -648,6 +714,71 @@ class TTS(commands.Cog):
                     res.cancel()
             file_path.unlink(missing_ok=True)
 
+    # ---------------- Lector de voz: crear / guardar / restaurar ----------------
+    def _activar_lector(self, guild_id, text_channel_id, voice, engine):
+        """Crea (o reactiva) el lector de mensajes de un server. Lo usan !leervc y la restauración tras un reinicio."""
+        if guild_id not in self.vc_readers:
+            queue = asyncio.Queue(maxsize=MAX_QUEUE)
+            task = self.bot.loop.create_task(self._audio_worker(guild_id))
+            self.vc_readers[guild_id] = {
+                'enabled': True,
+                'text_channel_id': text_channel_id,
+                'voice': voice,
+                'engine': engine,
+                'last_author_id': None,
+                'last_time': 0,
+                'queue': queue,
+                'task': task
+            }
+        else:
+            reader = self.vc_readers[guild_id]
+            reader['enabled'] = True
+            reader['text_channel_id'] = text_channel_id
+            reader['voice'] = voice
+            reader['engine'] = engine
+            reader['last_author_id'] = None
+            reader['last_time'] = 0
+
+            if 'task' not in reader or reader['task'].done():
+                reader['queue'] = asyncio.Queue(maxsize=MAX_QUEUE)
+                reader['task'] = self.bot.loop.create_task(self._audio_worker(guild_id))
+
+    def _estado_para_vigilante(self):
+        """Qué servers tienen el lector activo y en qué canal de voz (el vigilante lo guarda cada pocos segundos)."""
+        lectores = []
+        for guild_id, reader in self.vc_readers.items():
+            if not reader.get('enabled'):
+                continue
+            guild = self.bot.get_guild(guild_id)
+            vc = guild.voice_client if guild else None
+            if not vc or not vc.is_connected() or not vc.channel:
+                continue
+            lectores.append({
+                'guild_id': guild_id,
+                'voice_channel_id': vc.channel.id,
+                'text_channel_id': reader.get('text_channel_id'),
+                'voice': reader.get('voice'),
+                'engine': reader.get('engine'),
+            })
+        return {'lectores': lectores} if lectores else None
+
+    async def _restaurar_estado(self, datos):
+        """Tras un reinicio: vuelve a entrar al canal de voz y reactiva el lector (idempotente: el vigilante la reintenta)."""
+        for l in datos.get('lectores', []):
+            guild = self.bot.get_guild(l['guild_id'])
+            canal = guild.get_channel(l['voice_channel_id']) if guild else None
+            if canal is None:
+                logger.warning(f"TTS: no pude restaurar el lector, ya no existe el canal {l.get('voice_channel_id')}")
+                continue
+            vc = guild.voice_client
+            if vc is None or not vc.is_connected():
+                await canal.connect()
+            elif vc.channel != canal:
+                await vc.move_to(canal)
+            self._activar_lector(guild.id, l.get('text_channel_id'),
+                                 l.get('voice') or 'es-MX-DaliaNeural', l.get('engine') or DEFAULT_ENGINE)
+            logger.info(f'TTS: lector restaurado en {guild.name} / {canal.name}')
+
     # ---------------- Comandos ----------------
     @commands.command(name='leervc')
     async def leervc(self, ctx):
@@ -667,32 +798,10 @@ class TTS(commands.Cog):
         guild_id = ctx.guild.id
         voice = db.get_config(guild_id, 'tts_voice', 'es-MX-DaliaNeural')
         engine = db.get_config(guild_id, 'tts_engine', DEFAULT_ENGINE)
+        if engine not in ('gemini', 'edge'):    # p. ej. 'chatterbox' guardado de antes
+            engine = DEFAULT_ENGINE
 
-        if guild_id not in self.vc_readers:
-            queue = asyncio.Queue(maxsize=MAX_QUEUE)
-            task = self.bot.loop.create_task(self._audio_worker(guild_id))
-            self.vc_readers[guild_id] = {
-                'enabled': True,
-                'text_channel_id': ctx.channel.id,
-                'voice': voice,
-                'engine': engine,
-                'last_author_id': None,
-                'last_time': 0,
-                'queue': queue,
-                'task': task
-            }
-        else:
-            reader = self.vc_readers[guild_id]
-            reader['enabled'] = True
-            reader['text_channel_id'] = ctx.channel.id
-            reader['voice'] = voice
-            reader['engine'] = engine
-            reader['last_author_id'] = None
-            reader['last_time'] = 0
-
-            if 'task' not in reader or reader['task'].done():
-                reader['queue'] = asyncio.Queue(maxsize=MAX_QUEUE)
-                reader['task'] = self.bot.loop.create_task(self._audio_worker(guild_id))
+        self._activar_lector(guild_id, ctx.channel.id, voice, engine)
 
         modo = 'streaming' if (engine == 'gemini' and USE_STREAM) else 'normal'
         await ctx.send(f'🔊 Conectado y leyendo en {channel.mention} (motor: `{engine}`, modo: `{modo}`)')
@@ -740,10 +849,10 @@ class TTS(commands.Cog):
     @commands.command(name='setmotor')
     @commands.has_permissions(administrator=True)
     async def set_engine(self, ctx, motor: str = None):
-        """Cambiar motor de voz: gemini (IA, más natural, default) o edge (rápido, ilimitado)"""
+        """Cambiar motor de voz: gemini (IA en la nube) o edge (rápido, ilimitado)"""
 
         if motor not in ('edge', 'gemini'):
-            await ctx.send('❌ Usa `!setmotor edge` o `!setmotor gemini`')
+            await ctx.send('❌ Usa `!setmotor gemini` o `!setmotor edge`')
             return
 
         if motor == 'gemini' and not GEMINI_KEYS:
@@ -758,6 +867,29 @@ class TTS(commands.Cog):
 
         await ctx.send(f'✅ Motor de voz: `{motor}`')
 
+    @commands.command(name='ttsmodelos')
+    @commands.has_permissions(administrator=True)
+    async def tts_modelos(self, ctx):
+        """Lista los modelos con 'tts' en el nombre que ve tu key (para verificar los IDs de la cadena de respaldo)"""
+
+        if not GEMINI_KEYS:
+            await ctx.send('❌ `GEMINI_API_KEYS` está vacío en config.py')
+            return
+
+        def _listar():
+            client = self._get_client(GEMINI_KEYS[0])
+            return sorted(m.name.replace('models/', '') for m in client.models.list() if 'tts' in m.name.lower())
+
+        try:
+            nombres = await asyncio.to_thread(_listar)
+        except Exception as e:
+            await ctx.send(f'❌ No pude listar los modelos: `{type(e).__name__}: {str(e)[:300]}`')
+            return
+
+        cadena = ' → '.join(f'`{m}`' for m in GEMINI_MODELS)
+        lista = '\n'.join(f'`{n}`' for n in nombres) or '(ninguno)'
+        await ctx.send(f'Cadena actual: {cadena}\nModelos TTS que ve tu key:\n{lista}'[:1900])
+
     @commands.command(name='ttsdiag')
     @commands.has_permissions(administrator=True)
     async def tts_diag(self, ctx):
@@ -766,10 +898,11 @@ class TTS(commands.Cog):
         engine = db.get_config(ctx.guild.id, 'tts_engine', DEFAULT_ENGINE)
         lines = [
             f'Motor guardado en este server: `{engine}` | Streaming: `{USE_STREAM}`',
-            f'Keys en config: `{len(GEMINI_KEYS)}` | Modelo: `{GEMINI_TTS_MODEL}` | Voz: `{GEMINI_TTS_VOICE}`',
-            f'Keys disponibles ahora: `{len(self._available_keys())}/{len(GEMINI_KEYS)}` '
+            f'Keys en config: `{len(GEMINI_KEYS)}` | Voz: `{GEMINI_TTS_VOICE}`',
+            f'Cadena de modelos: ' + ' → '.join(f'`{m}`' for m in GEMINI_MODELS),
+            f'Combinaciones key+modelo disponibles ahora: `{len(self._available_combos())}/{len(GEMINI_KEYS) * len(GEMINI_MODELS)}` '
             f'(descansando por 429 o sin cupo local) | Streams simultáneos máx: `{GEMINI_CONCURRENCY}`',
-            f'Cupo local por key: `{GEMINI_RPM_PER_KEY or "sin límite"}`/min, '
+            f'Cupo local por key y modelo: `{GEMINI_RPM_PER_KEY or "sin límite"}`/min, '
             f'`{GEMINI_DAILY_PER_KEY or "sin límite"}`/día',
             f'Timeouts: lugar `{GEMINI_SLOT_WAIT:.0f}s` + primer audio `{GEMINI_FIRST_AUDIO_TIMEOUT:.0f}s` '
             f'+ edge `{EDGE_TIMEOUT:.0f}s` | Total máx por mensaje: `{SYNTH_TIMEOUT:.0f}s`',
@@ -805,12 +938,13 @@ class TTS(commands.Cog):
                 source = await asyncio.wait_for(
                     self._gemini_stream('Hola, esta es una prueba de voz con streaming.'), timeout=30)
                 t_first = time.monotonic() - t0
+                modelo = source.combo[1] if source.combo else '?'
                 await asyncio.to_thread(source.done.wait, 30)
                 t_total = time.monotonic() - t0
                 secs = source.total_bytes / SRC_BYTES_PER_SEC
                 source.cancel()
                 lines.append(
-                    f'✅ Streaming OK: primer audio a los `{t_first:.1f}s`, '
+                    f'✅ Gemini OK con `{modelo}`: primer audio a los `{t_first:.1f}s`, '
                     f'audio de `{secs:.1f}s` generado completo en `{t_total:.1f}s`'
                 )
             else:

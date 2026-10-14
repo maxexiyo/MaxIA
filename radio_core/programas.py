@@ -39,7 +39,7 @@ PROGRAMAS = {
                  "EDM, future bass, tropical house y pop electrónico. Maxia comenta con buena onda "
                  "datos curiosos y recuerdos de esa época, sin alargarse demasiado."),
         "generos": ("EDM y pop electrónico de 2016: future bass, tropical house, trap EDM, big room y electropop "
-                    "(estilo Marshmello, The Chainsmokers, Kygo, Alan Walker, Zedd, Flume, Martin Garrix, Porter Robinson)"),
+                    "(estilo Marshmello, The Chainsmokers, Kygo, Alan Walker, Zedd, Flume, Martin Garrix, Porter Robinson, Skrillex)"),
         "charla": True,       # solo comenta algunas canciones
         "noticias": True,     # sin noticiero durante el programa
         "busqueda": "canciones virales 2016 EDM future bass tropical house",
@@ -87,7 +87,7 @@ PROGRAMAS = {
         "busqueda": "canciones tranquilas para la noche baladas suaves",
     },
     "videojuegos_ost": {
-        "nombre": "La Era de los Videojuegos",
+        "nombre": "Gametime",
         "tema": ("Programa de bandas sonoras de videojuegos: los temas que marcaron generaciones. Maxia cuenta de qué juego es "
                  "cada tema, cómo se siente jugarlo y algún dato curioso de su música o su compositor, con cariño de jugadora "
                  "y sin inventar datos."),
@@ -122,20 +122,20 @@ PROGRAMAS = {
                     "Camila, Sin Bandera, Reik, Pablo Alborán, Jesse & Joy"),
         "charla": True,       # antes de cada canción: algo breve y cariñoso del artista o la canción
         "noticias": True,    # sin noticiero durante el programa
-        "busqueda": "mejores baladas románticas en español clásicas Luis Miguel José José",
+        "busqueda": "mejores baladas románticas en español clásicas Luis Miguel José José, juangabriel, etc",
     },
 }
 
 # (días 0=lunes … 6=domingo, o None = todos | inicio "HH:MM" | fin "HH:MM" | programa)
 PARRILLA = [
-    (None, "20:00", "23:00", "leyendas_del_rock"),
-    ([6], "12:00", "13:00", "sonidos_de_america"),       # solo domingos
-    ([2, 5], "14:00", "15:00", "cine_y_soundtracks"),    # solo miércoles y sábados
-    ([1, 4], "10:00", "12:00", "videojuegos_ost"),       # solo martes y viernes (2 h)
-    (None, "15:00", "16:00", "cumbias"),                 # 1 h diaria
+    (None, "00:00", "06:00", "madrugada"),
+    (None, "12:00", "13:00", "sonidos_de_america"),       # solo domingos
+    (None, "14:00", "15:00", "cine_y_soundtracks"),       # solo miércoles y sábados
+    (None, "15:00", "16:00", "cumbias"),                  # 1 h diaria
     (None, "16:00", "18:00", "virales_2016"),
     (None, "18:00", "20:00", "romanticas_de_siempre"),
-    (None, "00:00", "06:00", "madrugada"),
+    (None, "20:00", "22:00", "leyendas_del_rock"),
+    (None, "22:00", "00:00", "videojuegos_ost"),          # solo martes y viernes (2 h) ← movido
 ]
 
 

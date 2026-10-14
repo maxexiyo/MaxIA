@@ -1,5 +1,6 @@
 import subprocess
 import sys
+import asyncio
 
 # Función para verificar e instalar dependencias automáticamente
 def check_and_install(package, import_name=None):
@@ -106,6 +107,8 @@ async def diagnostico(ctx):
 
 async def main():
     """Función principal"""
+    from concurrent.futures import ThreadPoolExecutor
+    asyncio.get_running_loop().set_default_executor(ThreadPoolExecutor(max_workers=64))   # más hilos para DNS y demás
     async with bot:
         await vigilante.iniciar(bot)   # arranca el vigilante (una sola vez, ya dentro del loop)
         await load_cogs()

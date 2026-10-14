@@ -70,29 +70,40 @@ def marcar_nodo_enfermo(node, motivo: str = "falló al reproducir"):
     logger.debug(f"marcar_nodo_enfermo ignorado para {getattr(node, 'identifier', '?')}: {motivo}")
 
 
-# Nodos que se prefieren SIEMPRE que estén conectados (parte del host, sin importar mayúsculas). Si se caen, se usan los demás.
-NODOS_PRIORITARIOS = ["kasawa"]
+# Nodos que se prefieren SIEMPRE que estén conectados, EN ORDEN DE PREFERENCIA (parte del host, sin importar
+# mayúsculas): primero kasawa; si kasawa falla, tu servidor propio (Termux, 127.0.0.1); si ese también falla, los públicos.
+NODOS_PRIORITARIOS = ["kasawa", "127.0.0.1"]
 
 
 def _prioridad_nodo(idx: int) -> int:
-    """0 = nodo prioritario, 1 = los demás (para ordenar: los prioritarios primero)."""
+    """0 = primer nodo de NODOS_PRIORITARIOS (kasawa), 1 = el segundo (local), ... y len(NODOS_PRIORITARIOS) = los demás.
+    Menor = se usa antes."""
     try:
         host = LAVALINK_NODES_CONFIG[idx]["host"].lower()
     except Exception:
-        return 1
-    return 0 if any(p.lower() in host for p in NODOS_PRIORITARIOS) else 1
+        return len(NODOS_PRIORITARIOS)
+    for i, p in enumerate(NODOS_PRIORITARIOS):
+        if p.lower() in host:
+            return i
+    return len(NODOS_PRIORITARIOS)
 
 
 PRIO_ENFRIAMIENTO_S = 120      # tras un fallo REAL en el nodo prioritario, se usan los demás este tiempo
 _prio_fallo = {}               # identifier -> time.time() del último fallo real
 
 
-def es_nodo_prioritario(node) -> bool:
+def nivel_prioridad(node) -> int:
+    """0 = kasawa, 1 = nodo local, ... len(NODOS_PRIORITARIOS) = cualquier otro (público de respaldo)."""
     ident = getattr(node, "identifier", "")
     try:
-        return _prioridad_nodo(int(str(ident).replace("node", ""))) == 0
+        return _prioridad_nodo(int(str(ident).replace("node", "")))
     except Exception:
-        return False
+        return len(NODOS_PRIORITARIOS)
+
+
+def es_nodo_prioritario(node) -> bool:
+    """True para cualquiera de los nodos de NODOS_PRIORITARIOS (kasawa o el local)."""
+    return nivel_prioridad(node) < len(NODOS_PRIORITARIOS)
 
 
 def prioritario_enfriando(node) -> bool:
@@ -110,12 +121,14 @@ def limpiar_fallo_prioritario(node):
 
 
 def _nodo_usable(node) -> bool:
-    """Conectado, o prioritario (se usa AUNQUE el código lo vea desconectado, salvo que acabe de fallar de verdad)."""
+    """Conectado (y si es prioritario, que no esté enfriándose tras un fallo real). Solo el nodo de nivel 0 (kasawa)
+    se usa AUNQUE el código lo vea desconectado; el nodo local solo cuenta si está CONNECTED de verdad (si el
+    Termux está apagado, no tiene caso intentarlo)."""
     if node is None:
         return False
     if node.status == wavelink.NodeStatus.CONNECTED:
         return not (es_nodo_prioritario(node) and prioritario_enfriando(node))
-    return es_nodo_prioritario(node) and not prioritario_enfriando(node)
+    return nivel_prioridad(node) == 0 and not prioritario_enfriando(node)
 
 
 def _puntaje_nodo(idx: int) -> float:
@@ -272,6 +285,15 @@ def get_nodos_conectados():
         if node and _nodo_usable(node):
             nodos.append(node)
     return nodos
+
+
+def mejor_nodo_disponible(actual):
+    """Un nodo usable con MEJOR prioridad que `actual` (kasawa si estás en el local o en un público; el local si estás
+    en un público), o None. Sirve para volver al nodo preferido cuando se recupera."""
+    nodos = get_nodos_conectados()                    # ya vienen ordenados: el mejor nivel primero
+    if nodos and nivel_prioridad(nodos[0]) < nivel_prioridad(actual):
+        return nodos[0]
+    return None
 
 
 async def limpiar_voz(guild):

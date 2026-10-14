@@ -35,6 +35,21 @@ def hora_hablada(dt) -> str:
     return f"{art} {_NUM[h12]} {cola} {_periodo(h)}"
 
 
+def verbo_hora(dt) -> str:
+    """'Es' solo cuando la hora dicha es la una ('es la una y cuarto'); 'Son' en los demás casos."""
+    h, m = dt.hour, dt.minute
+    base = (h + 1) % 24 if m == 45 else h
+    return "Es" if (base % 12 or 12) == 1 else "Son"
+
+
 def anuncio_hora(dt) -> str:
     """Frase exacta para el aire: 'Son las ocho y cuarto de la noche, horario de México.'"""
-    return f"Son {hora_hablada(dt)}, horario de México."
+    return f"{verbo_hora(dt)} {hora_hablada(dt)}, horario de México."
+
+
+def anuncios_hora(dt) -> list:
+    """Las 2 variantes de la frase de la hora (cada una se guarda como audio aparte en voces_fijas/)."""
+    return [
+        anuncio_hora(dt),
+        f"Radio Maxia te lo recuerda: {verbo_hora(dt).lower()} {hora_hablada(dt)}.",
+    ]

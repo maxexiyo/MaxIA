@@ -1,13 +1,17 @@
-"""Voz de Maxia: edge-tts (es-MX, gratis) y TTS por OpenRouter (modelos de IA que generan voz, con tus keys de
-OPENROUTER_KEY). Si prefieres tu TTS de Gemini, pásale tu función al Director (tts=...):
+"""Voz de Maxia: Gemini TTS directo (tus GEMINI_API_KEYS, con cadena de modelos de respaldo), TTS por OpenRouter
+(OPENROUTER_KEY) y edge-tts (es-MX, gratis). Si prefieres tu TTS de Gemini, pásale tu función al Director (tts=...):
 async def mi_tts(texto) -> ruta_de_audio | None."""
 import asyncio
+import base64
 import hashlib
+import io
 import logging
 import os
 import re
 import sys
 import threading
+import time
+import wave
 
 import aiohttp
 
@@ -22,6 +26,153 @@ VELOCIDAD = os.getenv("RADIO_VOZ_VELOCIDAD", "+4%")
 # edge-tts, que suenan más naturales) y Piper/Kokoro solo como último recurso (sin internet o todo caído).
 # RADIO_TTS_LOCAL_PRIMERO=1 restaura el orden anterior (Piper → Kokoro antes que edge-tts).
 LOCAL_PRIMERO = os.getenv("RADIO_TTS_LOCAL_PRIMERO", "0") == "1"
+
+# ── Gemini TTS DIRECTO (con tus GEMINI_API_KEYS, sin pasar por OpenRouter) ─────────────────────────────────
+# Usa la misma voz, estilo y cadena de modelos que tu cog TTS (mismas variables de entorno y mismos valores por
+# defecto). Si un modelo se queda sin cuota (429), pasa al siguiente; si todos fallan devuelve None y sintetizar()
+# sigue con OpenRouter → edge-tts → locales.
+# Para forzar otra cosa solo en la radio: RADIO_GEMINI_MODELOS="modelo1,modelo2", RADIO_GEMINI_VOZ, RADIO_GEMINI_ESTILO.
+GEMINI_VOZ = os.getenv("RADIO_GEMINI_VOZ") or os.getenv("GEMINI_TTS_VOICE", "Kore")
+GEMINI_ESTILO = os.getenv("RADIO_GEMINI_ESTILO") or os.getenv(
+    "GEMINI_TTS_STYLE", "estilo mexicano, con entonacion, mete emocion")
+GEMINI_TIMEOUT = float(os.getenv("RADIO_GEMINI_TIMEOUT", "60"))
+GEMINI_COOLDOWN = float(os.getenv("GEMINI_TTS_COOLDOWN", "30"))
+_modelos_env = os.getenv("RADIO_GEMINI_MODELOS") or ",".join([
+    os.getenv("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts"),
+    os.getenv("GEMINI_TTS_FALLBACKS",
+              "gemini-3.8-flash-tts,gemini-3.1-flash-tts-preview,gemini-2.5-flash-preview-tts"),
+])
+GEMINI_MODELOS: list = []
+for _m in _modelos_env.split(","):
+    _m = _m.strip()
+    if _m and _m not in GEMINI_MODELOS:
+        GEMINI_MODELOS.append(_m)
+
+_gem = {"idx": 0, "cool": {}, "racha": {}, "clientes": {}}      # estado por (key, modelo)
+_gem_sem = asyncio.Semaphore(2)                                  # máx. 2 peticiones a Gemini al mismo tiempo
+
+
+def _claves_gemini() -> list:
+    """Las mismas keys que usa el cog TTS (GEMINI_API_KEYS de config.py); si no se puede importar, usa el entorno."""
+    keys = os.getenv("GEMINI_API_KEYS", "")
+    try:
+        from config import GEMINI_API_KEYS as _k
+        keys = _k
+    except Exception:
+        pass
+    if isinstance(keys, str):
+        keys = keys.split(",")
+    return [k.strip() for k in (keys or []) if k and k.strip()]
+
+
+def _es_limite(e: Exception) -> bool:
+    if getattr(e, "code", None) == 429 or getattr(e, "status_code", None) == 429:
+        return True
+    t = f"{type(e).__name__} {e}".lower()
+    return "429" in t or "resource_exhausted" in t or "too many" in t or "quota" in t
+
+
+def _pcm_a_wav(pcm: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(24000)
+        wf.writeframes(pcm)
+    return buf.getvalue()
+
+
+def _gemini_wav_sync(key: str, modelo: str, texto: str) -> bytes:
+    """Una petición a Gemini TTS (síncrona, se corre en un hilo). Devuelve un WAV completo."""
+    from google import genai
+    cliente = _gem["clientes"].get(key)
+    if cliente is None:
+        try:
+            cliente = genai.Client(api_key=key, http_options={"timeout": int(GEMINI_TIMEOUT * 1000)})
+        except Exception:
+            cliente = genai.Client(api_key=key)
+        _gem["clientes"][key] = cliente
+
+    if modelo.startswith("gemini-3.8"):                      # Interactions API (ya devuelve WAV)
+        if not hasattr(cliente, "interactions"):
+            raise RuntimeError("google-genai muy viejo, actualiza con: pip install -U google-genai")
+        contenido = {"type": "text", "text": texto}
+        if GEMINI_ESTILO:
+            contenido["annotations"] = [{"type": "speech_metadata", "style": GEMINI_ESTILO}]
+        it = cliente.interactions.create(
+            model=modelo,
+            input=[{"type": "user_input", "content": [contenido]}],
+            response_format={"type": "audio"},
+            generation_config={"speech_config": [{"voice": GEMINI_VOZ}]},
+        )
+        return base64.b64decode(it.output_audio.data)
+
+    from google.genai import types                           # modelos 3.1 / 2.5: PCM crudo → hay que envolverlo en WAV
+    r = cliente.models.generate_content(
+        model=modelo,
+        contents=f"{GEMINI_ESTILO}: {texto}" if GEMINI_ESTILO else texto,
+        config=types.GenerateContentConfig(
+            response_modalities=["AUDIO"],
+            speech_config=types.SpeechConfig(voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=GEMINI_VOZ))),
+        ),
+    )
+    return _pcm_a_wav(r.candidates[0].content.parts[0].inline_data.data)
+
+
+async def sintetizar_gemini(texto: str):
+    """Texto → ruta de un .wav generado directo con Gemini TTS (o None si no hay keys / todos los modelos fallan).
+    Prueba la cadena de modelos en orden y rota keys; un 429 hace "descansar" esa combinación key+modelo."""
+    texto = limpiar_para_voz(texto)
+    if len(texto) < 2:
+        return None
+    llaves = _claves_gemini()
+    if not llaves or not GEMINI_MODELOS:
+        return None
+    h = hashlib.sha1(f"gem|{GEMINI_VOZ}|{GEMINI_ESTILO}|{texto}".encode()).hexdigest()[:16]
+    ruta = C.DIR_CACHE / f"voz_g_{h}.wav"
+    if ruta.exists() and ruta.stat().st_size > 1000:
+        return str(ruta)
+
+    n = len(llaves)
+    ahora = time.monotonic()
+    orden_keys = [(_gem["idx"] + j) % n for j in range(n)]
+    combos = [(i, m) for m in GEMINI_MODELOS for i in orden_keys if _gem["cool"].get((i, m), 0) <= ahora]
+    if not combos:
+        logger.info("[radio] Gemini TTS: todas las combinaciones key+modelo están descansando")
+        return None
+
+    async with _gem_sem:
+        for i, m in combos:
+            try:
+                datos = await asyncio.wait_for(asyncio.to_thread(_gemini_wav_sync, llaves[i], m, texto),
+                                               timeout=GEMINI_TIMEOUT)
+                if datos and len(datos) > 1000:
+                    ruta.write_bytes(datos)
+                    _gem["idx"] = i
+                    _gem["racha"][(i, m)] = 0
+                    logger.info(f"[radio] Gemini TTS OK con {m} (key#{i + 1})")
+                    return str(ruta)
+                logger.warning(f"[radio] Gemini TTS {m} key#{i + 1} no devolvió audio")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[radio] Gemini TTS {m} key#{i + 1} falló: {type(e).__name__}: {str(e)[:150]}")
+                if _es_limite(e):                            # el descanso se duplica con cada 429 seguido (máx. 1 h)
+                    racha = _gem["racha"].get((i, m), 0) + 1
+                    _gem["racha"][(i, m)] = racha
+                    descanso = min(GEMINI_COOLDOWN * (2 ** (racha - 1)), 3600)
+                    if any(s in str(e).lower() for s in ("perday", "per day", "daily")):
+                        descanso = max(descanso, 3600)       # cuota del día agotada
+                    _gem["cool"][(i, m)] = time.monotonic() + descanso
+                elif isinstance(e, asyncio.TimeoutError):
+                    _gem["cool"][(i, m)] = time.monotonic() + GEMINI_COOLDOWN
+    try:
+        ruta.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return None
+
 
 # ── TTS por OpenRouter (POST /api/v1/audio/speech, compatible con OpenAI) ──────────────────────────────────
 # Respaldo de Gemini: el cog toma de tu cog TTS el modelo (GEMINI_TTS_MODEL), la voz (GEMINI_TTS_VOICE) y el estilo
@@ -138,18 +289,37 @@ async def sintetizar_kokoro(texto: str):
     return None
 
 
+async def precalentar_chatterbox() -> None:
+    """Ya no hace nada (Chatterbox se quitó). Se deja vacía por si alguna parte del bot todavía la llama."""
+    return None
+
+
 async def sintetizar_local(texto: str):
     """Voces locales gratis, en orden: Piper → Kokoro. None si ninguna está instalada o falla."""
     return await sintetizar_piper(texto) or await sintetizar_kokoro(texto)
 
 
-async def sintetizar(texto: str, openrouter: bool = True, piper: bool = True):
-    """Texto → ruta de audio en la caché (o None si falla). Orden: OpenRouter (Gemini TTS) → edge-tts → Piper → Kokoro (los locales al final; RADIO_TTS_LOCAL_PRIMERO=1 los pone antes de edge-tts).
-    Según RADIO_TTS_MOTOR: auto/openrouter prueban primero OpenRouter (si hay keys); edge/gemini lo saltan."""
-    if openrouter and C.TTS_MOTOR in ("auto", "openrouter"):      # Gemini (vía OpenRouter) primero
-        ruta_or = await sintetizar_openrouter(texto)
-        if ruta_or:
-            return ruta_or
+async def sintetizar(texto: str, openrouter: bool = True, piper: bool = True, gemini=None, chatterbox: bool = False):
+    """Texto → ruta de audio en la caché (o None si falla).
+    Orden: Gemini TTS directo → OpenRouter → edge-tts → Piper → Kokoro (los locales al final;
+    RADIO_TTS_LOCAL_PRIMERO=1 los pone antes de edge-tts).
+    Según RADIO_TTS_MOTOR: auto/gemini prueban Gemini directo y luego OpenRouter; openrouter lo invierte;
+    edge se salta la nube. `gemini=None` hereda el valor de `openrouter` (así los llamados viejos siguen igual).
+    `chatterbox` se ignora (se deja solo para no romper llamados viejos)."""
+    if gemini is None:
+        gemini = openrouter
+    if C.TTS_MOTOR in ("auto", "gemini", "chatterbox"):               # "chatterbox" = valor viejo de RADIO_TTS_MOTOR, se trata como auto
+        nube = [("gemini", gemini), ("openrouter", openrouter)]
+    elif C.TTS_MOTOR == "openrouter":
+        nube = [("openrouter", openrouter), ("gemini", gemini)]
+    else:
+        nube = []
+    for nombre, activo in nube:
+        if not activo:
+            continue
+        ruta_n = await (sintetizar_gemini(texto) if nombre == "gemini" else sintetizar_openrouter(texto))
+        if ruta_n:
+            return ruta_n
     if piper and LOCAL_PRIMERO:                       # (piper=False = "ya probé las voces locales")
         ruta_l = await sintetizar_local(texto)        # Piper → Kokoro
         if ruta_l:

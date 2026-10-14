@@ -31,7 +31,8 @@ import wavelink
 from discord.ext import commands, tasks
 
 from musica_core.nodos import (buscar_tracks_con_fallback, conectar_player, get_nodos_conectados, limpiar_voz,
-                               es_nodo_prioritario, marcar_fallo_prioritario, limpiar_fallo_prioritario, prioritario_enfriando)
+                               es_nodo_prioritario, marcar_fallo_prioritario, limpiar_fallo_prioritario, prioritario_enfriando,
+                               nivel_prioridad, mejor_nodo_disponible)
 from radio_core import config as C
 from radio_core.busqueda_web import WEB_ACTIVA, buscar_info, exitos_del_pais
 from radio_core.director import Director
@@ -58,6 +59,24 @@ IMAGENES_PROGRAMA: dict = {
     "romanticas_de_siempre": "",
 }
 MAX_NODOS_POR_SEGMENTO = 3   # nodos distintos (contando el original) que se prueban con un segmento que falla
+
+
+async def _cambiar_nodo(player, nodo):
+    """player.switch_node(nodo), tolerante al bug de MusicPlayer.pause().
+
+    Cuando el player no tiene un track actual, wavelink termina el cambio de nodo con `await self.pause(self.paused)`.
+    Si el MusicPlayer de musica_core/nodos.py sobrescribe pause() sin aceptar ese argumento, truena con TypeError
+    DESPUÉS de haber cambiado ya de nodo. Aquí lo detectamos, restauramos el estado de pausa con el pause original de
+    wavelink y seguimos. (Arreglo de raíz: que MusicPlayer.pause acepte `value: bool, /` y llame a super().pause(value).)
+    """
+    try:
+        await player.switch_node(nodo)
+    except TypeError as e:
+        if "pause" not in str(e) or player.node.identifier != nodo.identifier:
+            raise
+        logger.warning(f"[radio] MusicPlayer.pause() no acepta el argumento de wavelink; el cambio a {nodo.identifier} "
+                       f"ya se hizo, restauro la pausa a mano (arregla pause() en nodos.py)")
+        await wavelink.Player.pause(player, bool(player.paused))
 
 
 @dataclass
@@ -145,7 +164,8 @@ class Radio(commands.Cog):
         # para los textos: Director(..., ia=mi_funcion_ia)  con  ia(prompt, sistema, *, json_mode=False, max_tokens=900) -> str
         self.director = Director(self.emisora, buscar_cancion=self._buscar_cancion, publicar=self._publicar, tts=self._tts,
                                  buscar_web=self._buscar_web, exitos=self._exitos,
-                                 oyentes=self.emisora.oyentes_humanos, nodos_listos=self._nodos_listos)
+                                 oyentes=self.emisora.oyentes_humanos, nodos_listos=self._nodos_listos,
+                                 subir_imagen=self._publicar_imagen)
         self.emisora.on_cola_baja = self.director.rellenar
         self.emisora.on_tick = self.director.revisar_programa      # cambio de programa: tira lo que ya estaba en cola
         self.emisora.on_cambio = self._on_cambio
@@ -164,8 +184,16 @@ class Radio(commands.Cog):
         self._fallas_vistas: set = set()        # ids de segmentos fallidos ya comentados al aire (no repetir el chiste)
         self._aviso_canal = False
         self._vigilante: Optional[asyncio.Task] = None
+        self._gemini_pausa_hasta = 0.0          # breaker: mientras no pase este momento (monotonic) no se intenta Gemini TTS
+        self._ult_canal_voz: dict = {}          # gid -> último id de canal de voz conocido (para el vigilante)
 
     async def cog_load(self):
+        # Si el vigilante reinicia el bot, la radio vuelve sola al canal donde sonaba
+        try:
+            import vigilante
+            vigilante.registrar_estado('radio', self._estado_para_vigilante, self._restaurar_estado)
+        except Exception as e:
+            logger.info(f"[radio] sin restauración tras reinicios del vigilante ({e!r})")
         self._refrescar.start()
         self._vigilante = asyncio.get_running_loop().create_task(self._vigilar_loop())
         # La emisora corre SIEMPRE (radio "virtual"): la programación avanza por reloj aunque nadie esté conectado.
@@ -183,6 +211,11 @@ class Radio(commands.Cog):
             return True
 
     async def cog_unload(self):
+        try:
+            import vigilante
+            vigilante.quitar_estado('radio')
+        except Exception:
+            pass
         self._refrescar.cancel()
         if self._vigilante:
             self._vigilante.cancel()
@@ -326,6 +359,19 @@ class Radio(commands.Cog):
         self._subidos.append((msg, time.time()))
         return await self._resolver_url(msg.attachments[0].url)
 
+    async def _publicar_imagen(self, ruta: str):
+        """Sube una imagen (portada) al canal privado y devuelve su URL, o None."""
+        canal = self._canal_archivos()
+        if canal is None:
+            return None
+        try:
+            msg = await canal.send(file=discord.File(ruta))
+        except Exception as e:
+            logger.warning(f"[radio] no pude subir la portada: {e!r}")
+            return None
+        self._subidos.append((msg, time.time()))
+        return msg.attachments[0].url
+
     async def _resolver_url(self, url: str):
         """Pide a los nodos que aceptan http que lean el archivo. Se hace aquí (y no con buscar_tracks_con_fallback)
         para que un 403/429 del CDN de Discord no marque como 'bloqueados por YouTube' a tus nodos."""
@@ -361,7 +407,7 @@ class Radio(commands.Cog):
             modelo = "google/" + modelo
         return {"voz": buscar(("GEMINI_TTS_VOICE", "GEMINI_VOICE")), "estilo": buscar(("GEMINI_STYLE", "GEMINI_TTS_STYLE")), "modelo": modelo}
 
-    async def _tts(self, texto: str):
+    async def _tts(self, texto: str, solo_gemini: bool = False):
         """Texto → ruta de audio. Gemini TTS de tu cog (esperando cupo) → Gemini vía OpenRouter → edge-tts → Piper/Kokoro
         (los locales solo como último recurso; con RADIO_TTS_LOCAL_PRIMERO=1 van antes de OpenRouter y edge-tts)."""
         limpio = limpiar_para_voz(texto)
@@ -369,10 +415,10 @@ class Radio(commands.Cog):
             return None
         tts = self.bot.get_cog("TTS")
         if tts is None:
-            return await sintetizar(texto)            # sin cog TTS: OpenRouter (Gemini) → Piper → Kokoro → edge-tts
+            return None if solo_gemini else await sintetizar(texto)            # sin cog TTS: OpenRouter (Gemini) → Piper → Kokoro → edge-tts
         mod = sys.modules.get(type(tts).__module__)
         h = hashlib.sha1(f"{C.TTS_MOTOR}|{limpio}".encode()).hexdigest()[:16]
-        if C.TTS_MOTOR in ("auto", "gemini") and getattr(mod, "GEMINI_KEYS", None):
+        if C.TTS_MOTOR in ("auto", "gemini") and getattr(mod, "GEMINI_KEYS", None) and time.monotonic() >= self._gemini_pausa_hasta:
             ruta = C.DIR_CACHE / f"voz_g_{h}.wav"
             if ruta.exists() and ruta.stat().st_size > 1000:
                 return str(ruta)
@@ -380,7 +426,7 @@ class Radio(commands.Cog):
             es_limite = getattr(mod, "_is_rate_limit", lambda e: False)
             for intento in range(C.TTS_ESPERAS_CUPO + 1):
                 try:
-                    await asyncio.wait_for(tts._gemini_tts(limpio, ruta), timeout=60)
+                    await asyncio.wait_for(tts._gemini_tts(limpio, ruta), timeout=min(60, 20 + len(limpio) / 80))
                     if ruta.exists() and ruta.stat().st_size > 1000:
                         return str(ruta)
                 except asyncio.CancelledError:
@@ -391,9 +437,10 @@ class Radio(commands.Cog):
                         logger.info(f"[radio] Gemini TTS sin cupo; espero {C.TTS_ESPERA_S}s ({intento + 1}/{C.TTS_ESPERAS_CUPO})")
                         await asyncio.sleep(C.TTS_ESPERA_S)
                         continue
-                    logger.warning(f"[radio] Gemini TTS falló ({type(e).__name__}: {e}); uso edge-tts")
+                    self._gemini_pausa_hasta = time.monotonic() + 300     # breaker: 5 min sin tocar Gemini, directo a OpenRouter/edge
+                    logger.warning(f"[radio] Gemini TTS falló ({type(e).__name__}: {e}); pauso Gemini 5 min y uso respaldo")
                 break
-        if LOCAL_PRIMERO:
+        if LOCAL_PRIMERO and not solo_gemini:
             ruta_l = await sintetizar_local(texto)    # orden anterior: Piper → Kokoro (locales, sin cupo)
             if ruta_l:
                 return ruta_l
@@ -401,6 +448,8 @@ class Radio(commands.Cog):
             ruta_or = await sintetizar_openrouter(texto, **self._cfg_gemini())   # respaldo: mismo modelo/voz/estilo Gemini vía OpenRouter
             if ruta_or:
                 return ruta_or
+        if solo_gemini:                               # relleno de voces fijas: solo voz de Gemini, nunca edge/Piper
+            return None
         ruta = C.DIR_CACHE / f"voz_e_{h}.mp3"
         if ruta.exists() and ruta.stat().st_size > 1000:
             return str(ruta)
@@ -423,7 +472,7 @@ class Radio(commands.Cog):
             info = await asyncio.wait_for(nodo.fetch_info(), 6)
             ok = "http" in [s.lower() for s in info.source_managers]
         except Exception:
-            ok = es_nodo_prioritario(nodo)      # kasawa: se intenta aunque no responda la info; solo un error real lo descarta
+            ok = nivel_prioridad(nodo) == 0      # kasawa: se intenta aunque no responda la info; solo un error real lo descarta
         self._info_nodos[nodo.identifier] = (time.time(), ok)
         return ok
 
@@ -481,13 +530,13 @@ class Radio(commands.Cog):
             raise RuntimeError("Ningún nodo de Lavalink conectado acepta archivos por URL (fuente http).")
         if vc.node != nodo:
             try:
-                await vc.switch_node(nodo)
+                await _cambiar_nodo(vc, nodo)
             except Exception as e:
                 marcar_fallo_prioritario(nodo)
                 logger.warning(f"[radio] no pude usar {nodo.identifier}: {e!r}")
                 alt = [n for n in get_nodos_conectados() if n != nodo and n != vc.node and await self._acepta_http(n)]
                 if alt:
-                    await vc.switch_node(alt[0])
+                    await _cambiar_nodo(vc, alt[0])
         await vc.set_volume(C.VOLUMEN)
         return vc
 
@@ -506,22 +555,79 @@ class Radio(commands.Cog):
         if lector is not None and ctx.guild.id in getattr(lector, "vc_readers", {}):
             return await ctx.send("🗣️ Tengo activo el lector de mensajes por voz en este servidor. Apágalo con `!dejardeleer` y vuelve a prender la radio.")
 
-        gid = ctx.guild.id
         async with ctx.typing():
             try:
-                self.sesiones[gid] = Sesion(gid, None, ctx.channel)   # registrada ya: los eventos de la música normal se ignoran
-                vc = await self._preparar_player(ctx, canal)
+                await self._encender(ctx.guild, canal, ctx.channel)
             except Exception as e:
-                self.sesiones.pop(gid, None)
                 logger.exception("[radio] no pude preparar el player")
                 return await ctx.send(f"❌ No pude conectarme: `{e}`")
+
+    async def _encender(self, guild: discord.Guild, canal: discord.VoiceChannel, canal_texto):
+        """Conecta el player, mete el servidor a la emisora y publica el embed. Lo usan !radio y la restauración tras un
+        reinicio. Si algo falla, deja el servidor sin sesión y relanza el error."""
+        gid = guild.id
+
+        class _Ctx:                                  # _preparar_player solo necesita ctx.guild
+            pass
+        ctx_min = _Ctx()
+        ctx_min.guild = guild
+        try:
+            self.sesiones[gid] = Sesion(gid, None, canal_texto)   # registrada ya: los eventos de la música normal se ignoran
+            vc = await self._preparar_player(ctx_min, canal)
             ses = self.sesiones[gid]
             ses.vc = vc
             if not self.emisora.corriendo:
                 self.director.reiniciar()
                 await self.emisora.iniciar()
             await self.emisora.agregar_sesion(gid, vc)
-        ses.mensaje = await ctx.send(embed=self._embed(self.emisora.estado()))
+        except Exception:
+            self.sesiones.pop(gid, None)
+            raise
+        ses.mensaje = await canal_texto.send(embed=self._embed(self.emisora.estado()))
+
+    # ═══ reanudar tras un reinicio del vigilante ═══════════════════════════════════
+    def _estado_para_vigilante(self):
+        """Servidores con la radio al aire y su canal de voz (el vigilante lo guarda cada pocos segundos)."""
+        sesiones = []
+        for gid, ses in self.sesiones.items():
+            canal = getattr(ses.vc, "channel", None)
+            if canal is not None:
+                self._ult_canal_voz[gid] = canal.id
+            canal_id = self._ult_canal_voz.get(gid)      # durante una recuperación de voz el canal puede ser None un momento
+            if not canal_id or ses.vc is None:
+                continue
+            sesiones.append({"guild_id": gid, "voice_channel_id": canal_id,
+                             "text_channel_id": getattr(ses.canal_texto, "id", None)})
+        for gid in list(self._ult_canal_voz):
+            if gid not in self.sesiones:
+                self._ult_canal_voz.pop(gid, None)
+        return {"sesiones": sesiones} if sesiones else None
+
+    async def _restaurar_estado(self, datos):
+        """Tras un reinicio: vuelve a prender la radio en el canal donde sonaba. Idempotente (el vigilante reintenta)."""
+        for _ in range(10):                                  # tras un arranque, los nodos tardan en conectarse
+            if self._nodos_listos():
+                break
+            await asyncio.sleep(3)
+        errores = []
+        for d in datos.get("sesiones", []):
+            gid = d["guild_id"]
+            try:
+                if gid in self.sesiones and self.sesiones[gid].vc is not None:
+                    continue                                 # ya restaurada en un intento anterior
+                guild = self.bot.get_guild(gid)
+                canal = guild.get_channel(d["voice_channel_id"]) if guild else None
+                if canal is None:
+                    logger.warning(f"[radio] no pude restaurar {gid}: ya no existe el canal de voz")
+                    continue
+                canal_texto = guild.get_channel(d.get("text_channel_id") or 0) or canal
+                await self._encender(guild, canal, canal_texto)
+                logger.info(f"[radio] restaurada en {guild.name} / {canal.name}")
+            except Exception as e:
+                logger.warning(f"[radio] no pude restaurar el servidor {gid}: {type(e).__name__}: {e}")
+                errores.append(e)
+        if errores:
+            raise errores[0]
 
     async def desactivar(self, guild_id: int, *, aviso: bool = True):
         ses = self.sesiones.pop(guild_id, None)
@@ -556,34 +662,13 @@ class Radio(commands.Cog):
                 return
             await self.desactivar(gid, aviso=False)
             return
+        # Sin oyentes la radio YA NO se apaga sola: se queda al aire en el canal, igual que la radio "virtual" sin nadie
+        # conectado (la voz de Maxia depende de los oyentes que cuenta la emisora). Se apaga con !radio o si la sacan del canal.
         canal = getattr(ses.vc, "channel", None)
-        if canal and not [m for m in canal.members if not m.bot]:
-            if gid not in self._vacio:
-                self._vacio[gid] = asyncio.create_task(self._salir_si_vacio(gid))
-        else:
-            t = self._vacio.pop(gid, None)
-            if t:
-                t.cancel()
-            # entró una persona y el player no está sonando: ponerlo justo donde va la radio
-            if (not member.bot and after.channel == canal and before.channel != canal
-                    and not getattr(ses.vc, "playing", True)):
-                await self.emisora.resincronizar(gid)
-
-    async def _salir_si_vacio(self, gid: int):
-        try:
-            await asyncio.sleep(45)
-            ses = self.sesiones.get(gid)
-            canal = getattr(ses.vc, "channel", None) if ses else None
-            if ses and canal and not [m for m in canal.members if not m.bot]:
-                try:
-                    await ses.canal_texto.send("📻 Me quedé solo en el canal, apago la radio por aquí. ¡Vuelve cuando quieras!")
-                except Exception:
-                    pass
-                await self.desactivar(gid)
-        except asyncio.CancelledError:
-            pass
-        finally:
-            self._vacio.pop(gid, None)
+        # entró una persona y el player no está sonando: ponerlo justo donde va la radio
+        if (canal and not member.bot and after.channel == canal and before.channel != canal
+                and not getattr(ses.vc, "playing", True)):
+            await self.emisora.resincronizar(gid)
 
     # ═══ eventos de Lavalink (solo en servidores con radio) ════════════════════════
     @commands.Cog.listener()
@@ -594,15 +679,15 @@ class Radio(commands.Cog):
             return
         track = getattr(payload, "track", None)
         prio = None
-        try:   # terminó bien: si está en un nodo de respaldo y kasawa ya está disponible, volver a kasawa
-            if not es_nodo_prioritario(player.node) and "exception" not in str(getattr(payload, "reason", "")).lower():
-                prio = next((n for n in get_nodos_conectados() if es_nodo_prioritario(n)), None)
-                if prio is not None and not prioritario_enfriando(prio):
-                    await player.switch_node(prio)
+        try:   # terminó bien: si hay un nodo MEJOR disponible (kasawa; o el local si estás en un público), volver a él
+            if "exception" not in str(getattr(payload, "reason", "")).lower():
+                prio = mejor_nodo_disponible(player.node)
+                if prio is not None:
+                    await _cambiar_nodo(player, prio)
         except Exception as e:
             if prio is not None:
                 marcar_fallo_prioritario(prio)
-            logger.debug(f"[radio] no volví a kasawa: {e!r}")
+            logger.debug(f"[radio] no volví a un nodo preferido: {e!r}")
         self.emisora.notificar_fin(player.guild.id, getattr(track, "encoded", None), str(getattr(payload, "reason", "")))
 
     @commands.Cog.listener()
@@ -631,7 +716,7 @@ class Radio(commands.Cog):
                 continue
             visto[1].add(nodo.identifier)
             try:
-                await player.switch_node(nodo)
+                await _cambiar_nodo(player, nodo)
                 await self.emisora.resincronizar(gid)
                 logger.info(f"[radio] servidor {gid}: «{titulo}» reintentada en {nodo.identifier}")
                 return
@@ -758,7 +843,7 @@ class Radio(commands.Cog):
                 try:
                     nuevo = await self._nodo_con_http()
                     if nuevo:
-                        await player.switch_node(nuevo)
+                        await _cambiar_nodo(player, nuevo)
                         await self.emisora.resincronizar(gid)
                 except Exception as e:
                     logger.warning(f"[radio] servidor {gid}: no pude pasar la radio a otro nodo: {e!r}")

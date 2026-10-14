@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import config as C
 from .emisora import Segmento
-from .horas import anuncio_hora, hora_hablada
+from .horas import anuncio_hora, anuncios_hora, hora_hablada
 from .busqueda_web import WEB_ACTIVA, WEB_DATOS, buscar_info, exitos_del_pais
 from .ia import describir_imagen, extraer_json, pedir_ia
 from .mezcla import Audio, armar_segmento
@@ -32,6 +32,7 @@ from .noticias import obtener_noticias
 from .saltos import inicio_cancion
 from .programas import PROGRAMAS, buscar_audio, fondos_locales, programa_para, proximo_cambio
 from .voz import sintetizar
+from .voces_fijas import hablar_fijo, migrar_voces_hora, variantes, variantes_bienvenida_noticiero
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +77,7 @@ NOTICIERO_HORAS = range(6, 24)   # 6:00 a 23:00; de 00:00 a 05:00 no hay noticie
 NOTICIERO = {"intro": "noticiero/intro", "intro_max_seg": 20, "fondo": "noticiero/fondo",      # en radio_data/audio/programas/
              "outro": True, "outro_max_seg": 20}   # outro: al terminar la voz de cierre vuelve a sonar la musiquita de la intro
 SILENCIO_SIN_OYENTES = os.getenv("RADIO_SILENCIO_SIN_OYENTES", "1") != "0"   # sin oyentes: solo música (el noticiero sí suena)
-VOCES_HORA_MAX = int(os.getenv("RADIO_VOCES_HORA_MAX", "800"))   # voces de la hora guardadas en radio_data/voces_hora/ (al pasarse, se borran las más viejas)
+VOCES_HORA_MAX = int(os.getenv("RADIO_VOCES_HORA_MAX", "0"))   # voces de la hora guardadas en radio_data/voces_hora/. 0 = sin límite (se quedan para siempre); >0 = al pasarse, se borran las más viejas
 ENFRIAMIENTO_CANCION_S = 2 * 3600   # una canción (propuesta o pedida) no vuelve a sonar hasta pasadas 2 horas
 TTL_CACHE_JINGLE_S = 5 * 3600     # las URLs de los archivos subidos a Discord caducan; se vuelven a subir
 # ── Ahorro de búsquedas web (ver busqueda_web.py: caché + conocimiento propio primero) ──
@@ -84,6 +85,12 @@ WEB_POR_ARTISTA = os.getenv("RADIO_WEB_POR_ARTISTA", "1") != "0"   # datos de ca
 WEB_TTL_TEMA_DIAS = 7                  # guía de internet para proponer canciones del programa: se refresca cada 7 días
 WEB_TTL_NOTICIAS_DIAS = 0.25           # contexto de cada noticia: vale ~6 h (las noticias caducan rápido)
 NOTICIAS_BUSQUEDA_WEB_MAX = 10         # cuántas historias del noticiero buscan contexto en internet (las demás usan titular+resumen). Bájalo (p. ej. 5) para gastar menos
+
+
+RELLENO_ACTIVO = os.getenv("RADIO_RELLENO", "1") != "0"                   # canción de relleno antes del noticiero (0 = apagado)
+RELLENO_DIR = Path(os.getenv("RADIO_RELLENO_DIR") or (C.DIR_RADIO / "relleno"))   # carpeta con tus canciones locales (se detectan solas, con subcarpetas)
+RELLENO_EXT = {".mp3", ".m4a", ".flac", ".ogg", ".opus", ".wav", ".aac", ".wma"}
+RELLENO_VENTANA_S = int(os.getenv("RADIO_RELLENO_VENTANA_S", "330"))      # entra cuando faltan ≤ ~5 min para el noticiero
 
 
 def _norm(s: str) -> str:
@@ -123,7 +130,7 @@ def _acepta(fn):
 class Director:
     def __init__(self, emisora, *, buscar_cancion, publicar, ia=pedir_ia, tts=sintetizar,
                  noticias=obtener_noticias, describir=describir_imagen, ahora=C.ahora_local,
-                 buscar_web=buscar_info, exitos=exitos_del_pais, oyentes=None, nodos_listos=None):
+                 buscar_web=buscar_info, exitos=exitos_del_pais, oyentes=None, nodos_listos=None, subir_imagen=None):
         """
         buscar_cancion(artista, titulo) -> dict(track, titulo, artista, duracion, portada, url) | None
         buscar_web(consulta)            -> texto con lo encontrado en internet | None   (tu IA con búsqueda web)
@@ -139,6 +146,11 @@ class Director:
         self.ia, self.tts, self.noticias, self.describir, self.ahora = ia, tts, noticias, describir, ahora
         self.buscar_web, self.exitos = buscar_web, exitos
         self._web_acepta = _acepta(buscar_web)
+        self.subir_imagen = subir_imagen              # subir_imagen(ruta) -> url | None  (portadas de las canciones de relleno)
+        self._relleno_info = {}                       # (ruta, mtime) -> {"dur","titulo","artista"} | None
+        self._relleno_ts = 0.0
+        self._relleno_tarea = None
+        self._relleno_usados = deque(maxlen=30)
         self._lock = asyncio.Lock()
         self.reiniciar()
 
@@ -158,6 +170,7 @@ class Director:
             self._prearmado[1].cancel()
         self._prearmado = None            # (hora, tarea) del noticiero que se está armando en segundo plano
         self._noticiero_hecho = set()     # horas en punto que ya tuvieron noticiero
+        self._relleno_hecho = set()       # horas de noticiero que ya tuvieron su canción de relleno
         self._cache_jingles = {}
         self._relleno_seguido = 0
         self._purgado_para = None                   # programa para el que ya se vació la cola al cambiar la parrilla
@@ -587,6 +600,137 @@ class Director:
             return texto
         return random.choice(plantillas).format(**self._datos_voz())
 
+    # ═══ canción de relleno antes del noticiero (archivos locales del teléfono) ═══════
+    async def _probar_archivo(self, ruta: Path):
+        """ffprobe: duración, título y artista del archivo (si no trae etiquetas, usa «Artista - Título» del nombre)."""
+        p = None
+        try:
+            p = await asyncio.create_subprocess_exec(
+                C.FFPROBE, "-v", "error", "-show_entries", "format=duration:format_tags", "-of", "json", str(ruta),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            out, _ = await asyncio.wait_for(p.communicate(), 20)
+            fmt = json.loads(out.decode("utf-8", "ignore") or "{}").get("format", {})
+            dur = float(fmt.get("duration") or 0)
+        except Exception:
+            if p is not None and p.returncode is None:
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+            return None
+        if dur <= 0:
+            return None
+        tags = {str(k).lower(): str(v).strip() for k, v in (fmt.get("tags") or {}).items()}
+        titulo = tags.get("title", "")
+        artista = tags.get("artist") or tags.get("album_artist") or tags.get("albumartist") or ""
+        if not titulo:
+            if " - " in ruta.stem:
+                a, t = ruta.stem.split(" - ", 1)
+                artista, titulo = artista or a.strip(), t.strip()
+            else:
+                titulo = ruta.stem
+        return {"dur": dur, "titulo": titulo[:100], "artista": (artista or "Desconocido")[:80]}
+
+    def _escanear_relleno(self) -> list:
+        try:
+            RELLENO_DIR.mkdir(parents=True, exist_ok=True)
+            return [p for p in RELLENO_DIR.rglob("*") if p.is_file() and p.suffix.lower() in RELLENO_EXT]
+        except Exception:
+            return []
+
+    async def _relleno_actualizar(self) -> None:
+        """Detecta los archivos de la carpeta (nuevos y borrados) y lee sus datos una sola vez por archivo."""
+        archivos = await asyncio.to_thread(self._escanear_relleno)
+        info, sem = {}, asyncio.Semaphore(4)
+
+        async def _uno(p):
+            try:
+                clave = (str(p), p.stat().st_mtime)
+            except OSError:
+                return
+            if clave in self._relleno_info:
+                info[clave] = self._relleno_info[clave]
+                return
+            async with sem:
+                info[clave] = await self._probar_archivo(p)
+        await asyncio.gather(*(_uno(p) for p in archivos))
+        self._relleno_info, self._relleno_ts = info, time.monotonic()
+        logger.info(f"[radio] canciones de relleno detectadas: {sum(1 for v in info.values() if v)} en {RELLENO_DIR}")
+
+    def _relleno_refrescar(self):
+        """Lanza (en segundo plano) la revisión de la carpeta cada ~10 min. Devuelve la tarea si hay una corriendo/nueva."""
+        if self._relleno_tarea is not None and not self._relleno_tarea.done():
+            return self._relleno_tarea
+        if time.monotonic() - self._relleno_ts < 600:
+            return None
+        self._relleno_tarea = asyncio.get_running_loop().create_task(self._relleno_actualizar())
+        return self._relleno_tarea
+
+    async def _elegir_relleno(self, falta: float):
+        t = self._relleno_refrescar()
+        if t is not None and not self._relleno_info:           # primera vez: se espera a que termine de leer la carpeta
+            try:
+                await asyncio.wait_for(asyncio.shield(t), 90)
+            except Exception:
+                return None
+        cands = [(Path(k[0]), v) for k, v in self._relleno_info.items()
+                 if v and 60 <= v["dur"] <= falta + NOTICIERO_ADELANTO_S]
+        if not cands:
+            return None
+        mejor = max(v["dur"] for _, v in cands)
+        cerca = [c for c in cands if c[1]["dur"] >= mejor - 90]      # las que mejor llenan el hueco hasta el noticiero
+        nuevas = [c for c in cerca if str(c[0]) not in self._relleno_usados] or cerca
+        return random.choice(nuevas)
+
+    async def _portada_relleno(self, ruta: Path):
+        """Portada incrustada en el archivo → imagen subida a Discord (url) para el embed. None si no trae."""
+        if self.subir_imagen is None:
+            return None
+        img = C.DIR_CACHE / f"rel_{uuid.uuid4().hex[:10]}.jpg"
+        try:
+            p = await asyncio.create_subprocess_exec(
+                C.FFMPEG, "-y", "-v", "error", "-i", str(ruta), "-an", "-map", "0:v:0", "-frames:v", "1",
+                "-vf", "scale='min(600,iw)':-2", str(img), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(p.wait(), 30)
+            if p.returncode != 0 or not img.exists() or img.stat().st_size < 500:
+                return None
+            return await self.subir_imagen(str(img))
+        except Exception:
+            return None
+        finally:
+            img.unlink(missing_ok=True)
+
+    async def bloque_relleno(self, clave: str, falta: float):
+        """Una canción local (que quepa antes del noticiero) con su título, artista y portada del archivo."""
+        elegido = await self._elegir_relleno(falta)
+        if elegido is None:
+            return []
+        ruta, inf = elegido
+        salida = C.DIR_CACHE / f"rel_{uuid.uuid4().hex[:10]}.mp3"
+        try:
+            p = await asyncio.create_subprocess_exec(
+                C.FFMPEG, "-y", "-v", "error", "-i", str(ruta), "-vn", "-map", "0:a:0",
+                "-af", f"afade=t=out:st={max(0.0, inf['dur'] - 4):.2f}:d=4",      # fade out de los últimos 4 s
+                "-c:a", "libmp3lame", "-b:a", "128k", str(salida), stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(p.wait(), 120)
+            if p.returncode != 0 or not salida.exists():
+                logger.warning(f"[radio] no pude convertir el relleno {ruta.name}")
+                return []
+            track = await self.publicar(str(salida))
+            portada = await self._portada_relleno(ruta) if track is not None else None
+        except Exception as e:
+            logger.warning(f"[radio] no pude armar el relleno {ruta.name}: {e!r}")
+            return []
+        finally:
+            salida.unlink(missing_ok=True)
+        if track is None:
+            return []
+        self._relleno_usados.append(str(ruta))
+        dur = (getattr(track, "length", 0) or 0) / 1000 or inf["dur"]
+        meta = {"titulo": inf["titulo"], "artista": inf["artista"], "portada": portada, "url": None, "pedida_por": None, "relleno": True}
+        logger.info(f"[radio] relleno antes del noticiero: «{inf['artista']} - {inf['titulo']}» ({dur / 60:.1f} min)")
+        return [Segmento("cancion", track, dur, meta, PROGRAMAS[clave]["nombre"], "relleno")]
+
     async def bloque_apertura(self, clave: str, fondo):
         d = self._datos_voz()
         texto = await self._frase_generada(
@@ -688,6 +832,8 @@ class Director:
         return [s] if s else []
 
     def _podar_voces_hora(self, carpeta) -> None:
+        if VOCES_HORA_MAX <= 0:                    # sin límite: nunca se borra nada
+            return
         archivos = sorted((p for p in carpeta.glob("hora_*.*") if p.is_file()), key=lambda p: p.stat().st_mtime)
         for p in archivos[:max(0, len(archivos) - VOCES_HORA_MAX)]:
             try:
@@ -728,7 +874,20 @@ class Director:
         """Solo la hora exacta, con la cortinilla del programa (o el motivo de tres notas si no tiene)."""
         self.n_hora = 0
         self.meta_hora = random.randint(*C.CANCIONES_ENTRE_HORA)
-        voz = await self._voz_hora(anuncio_hora(self._ahora_al_aire()))
+        dt = self._ahora_al_aire()
+        try:
+            if not getattr(self, "_voces_hora_migradas", False):       # una sola vez: pasa lo ya guardado en voces_hora/ a voces_fijas/
+                self._voces_hora_migradas = True
+                n = await asyncio.to_thread(
+                    migrar_voces_hora, C.DIR_RADIO / "voces_hora",
+                    lambda t: hashlib.sha1(_norm(t).encode("utf-8")).hexdigest()[:16],
+                    lambda h, m: anuncios_hora(datetime(2000, 1, 1, h, m)))
+                if n:
+                    logger.info(f"[radio] {n} voces de la hora pasadas a voces_fijas/")
+            voz = await hablar_fijo(self.tts, "hora", variantes(f"hora_{dt:%H%M}", anuncios_hora(dt)))
+        except Exception as e:
+            logger.warning(f"[radio] voces fijas de la hora fallaron ({e!r}); uso el método anterior")
+            voz = await self._voz_hora(anuncio_hora(dt))
         if not voz:
             return []
         s = await self._segmento(
@@ -892,7 +1051,7 @@ class Director:
         hora = hora_hablada(ref)
         primero = " Es el primer noticiero del día." if ref.hour == 6 else ""
         intro = await self._texto(
-            f"Abre el noticiero de {C.NOMBRE} con tu estilo natural en 2 o 3 frases: son las {hora} (dilo tal cual) y adelanta de qué "
+            f"La bienvenida al noticiero de {C.NOMBRE} ya se dijo al aire: no saludes ni la repitas. Sigue con tu estilo natural en 1 o 2 frases: son las {hora} (dilo tal cual) y adelanta de qué "
             f"países vienen las noticias de hoy ({', '.join(sorted({n['pais'] for n in notas if n['pais']})[:6])}).{primero} "
             f"Sin inventar datos.", 300) or "Es hora de las noticias de Latinoamérica."
         cierre = await self._texto(
@@ -911,15 +1070,26 @@ class Director:
 
         async def _voz(g):
             async with sem_tts:
-                return await self.tts(" ".join(g))
+                try:
+                    return await asyncio.wait_for(self.tts(" ".join(g)), 100)
+                except Exception as e:
+                    logger.warning(f"[radio] voz del noticiero falló: {type(e).__name__}: {e}")
+                    return None
         rutas = list(await asyncio.gather(*(_voz(g) for g in grupos)))
         if not all(rutas):                                       # un trozo falló: un reintento solo de esos
             for k, r in enumerate(rutas):
                 if not r:
-                    rutas[k] = await self.tts(" ".join(grupos[k]))
+                    rutas[k] = await _voz(grupos[k])
         rutas = [r for r in rutas if r]
         if not rutas:
             return []
+        try:                                                     # bienvenida fija: 2-5 variantes guardadas para siempre en radio_data/voces_fijas/
+            bienvenida = await hablar_fijo(self.tts, "noticiero", variantes_bienvenida_noticiero())
+        except Exception as e:
+            logger.warning(f"[radio] no pude poner la bienvenida fija del noticiero: {e!r}")
+            bienvenida = None
+        if bienvenida:
+            rutas.insert(0, bienvenida)
         voz = await self._unir_voces(rutas)
         if not voz:
             return []
@@ -989,6 +1159,8 @@ class Director:
         falta_n = self._seg_hasta_cambio(t_n) if t_n is not None else None
         if t_n is not None and falta_n <= NOTICIERO_PREARMADO_S:
             self._prearmar_noticiero(t_n)
+        if RELLENO_ACTIVO and t_n is not None and falta_n <= 900:
+            self._relleno_refrescar()           # va leyendo la carpeta de relleno con tiempo
 
         if clave != self.programa_activo:       # llegamos tarde al cambio: transición inmediata
             return await self._transicion(clave)
@@ -1001,6 +1173,13 @@ class Director:
 
         if prog.get("solo_musica"):             # madrugada: sin charla, hora, noticias, jingles ni mensajes
             return await self.bloque_cancion(clave)
+
+        if (RELLENO_ACTIVO and t_n is not None and t_n not in self._relleno_hecho
+                and NOTICIERO_ADELANTO_S < falta_n <= RELLENO_VENTANA_S):
+            self._relleno_hecho.add(t_n)         # una sola vez por noticiero
+            segs = await self.bloque_relleno(clave, falta_n)
+            if segs:
+                return segs
 
         if t_n is not None and falta_n <= NOTICIERO_ADELANTO_S:
             segs = await self._noticiero_para(t_n, clave)

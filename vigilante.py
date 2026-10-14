@@ -19,6 +19,17 @@ Qué vigila (cada cosa tiene su propio código de salida, para saber por qué se
   El cierre solo sirve si algo vuelve a arrancar el bot: usa run_bot.sh (o pm2/systemd). Cada reinicio queda anotado en
   vigilante_reinicios.log y al arrancar el bot muestra el motivo del último.
 
+Que el audio vuelva solo tras un reinicio (música, radio, lector de TTS...)
+  Al reiniciarse el proceso se pierden las conexiones de voz y lo que sonaba. Para que vuelva, cada cog de audio registra
+  DOS funciones (en su cog_load, o donde cargue):
+      vigilante.registrar_estado("musica", guardar, restaurar)
+    guardar()   -> dict | None   síncrona y rápida: describe lo que está sonando AHORA (canal de voz, cola, posición...).
+                                 Solo tipos JSON (números, textos, listas, dicts). Devuelve None si no hay nada.
+                                 El vigilante la llama cada VIGILANTE_ESTADO_S segundos y guarda el resultado en disco.
+    restaurar(datos)             async: recibe lo último que devolvió guardar() y reconecta/reanuda. Debe ser idempotente
+                                 (si falla, se reintenta). Solo se llama tras un reinicio hecho por el vigilante.
+  Un reinicio manual (Ctrl+C, pkill...) NO restaura nada. En cog_unload llama vigilante.quitar_estado("musica").
+
 Diagnóstico de algo que se queda "pensando" (el bot responde, pero un comando/proceso no termina):
     pkill -USR1 -f "python3 main.py"     -> el log muestra qué está esperando cada tarea
     pkill -USR2 -f "python3 main.py"     -> escribe en vigilante_volcado.txt la pila de TODOS los hilos
@@ -48,13 +59,19 @@ Variables de entorno (todas opcionales):
   VIGILANTE_FDS_PCT=0.85       fracción del límite de archivos abiertos que dispara el reinicio (0 = no vigilar)
   VIGILANTE_DISCO_MB=200       avisa si queda menos disco libre que esto (0 = no vigilar)
   VIGILANTE_RESUMEN_S=600      cada cuántos segundos escribe un resumen de salud (0 = no)
+  VIGILANTE_AUTORREINICIO=1    al cerrar, el propio bot se vuelve a lanzar solo (0 = depender de run_bot.sh/pm2)
   VIGILANTE_REINICIAR=0        solo avisar y volcar, sin cerrar el proceso
+  VIGILANTE_ESTADO=ruta        archivo donde se guarda lo que suena (por defecto vigilante_estado.json)
+  VIGILANTE_ESTADO_S=5         cada cuántos segundos se guarda ese estado
+  VIGILANTE_RESTAURAR_S=600    máximo de segundos entre el cierre y el arranque para restaurar el audio (0 = no restaurar)
   VIGILANTE_VOLCADO=ruta       archivo del volcado (por defecto vigilante_volcado.txt)
   VIGILANTE_REINICIOS=ruta     archivo con el historial de reinicios (por defecto vigilante_reinicios.log)
   VIGILANTE_DEBUG_LOOP=1       DIAGNÓSTICO: asyncio avisa de cada llamada que bloquee más de 1 s (consume más CPU)
 """
 import asyncio
 import faulthandler
+import inspect
+import json
 import logging
 import os
 import shutil
@@ -90,6 +107,10 @@ RESUMEN_S = _num("VIGILANTE_RESUMEN_S", 600)
 REINICIAR = os.getenv("VIGILANTE_REINICIAR", "1") != "0"
 ARCHIVO_VOLCADO = os.getenv("VIGILANTE_VOLCADO", "vigilante_volcado.txt")
 ARCHIVO_REINICIOS = os.getenv("VIGILANTE_REINICIOS", "vigilante_reinicios.log")
+ARCHIVO_ESTADO = os.getenv("VIGILANTE_ESTADO", "vigilante_estado.json")
+ESTADO_PERIODO_S = max(1.0, _num("VIGILANTE_ESTADO_S", 5))
+RESTAURAR_MAX_S = _num("VIGILANTE_RESTAURAR_S", 600)
+AUTORREINICIO = os.getenv("VIGILANTE_AUTORREINICIO", "1") != "0"     # 0 = solo cerrar (si ya usas run_bot.sh/pm2)
 DEBUG_LOOP = os.getenv("VIGILANTE_DEBUG_LOOP", "0") == "1"
 
 _inicio = time.monotonic()
@@ -100,6 +121,9 @@ _iniciado = False
 _tareas = []                  # referencias fuertes: si no, el recolector de basura puede borrar las tareas de fondo
 _pulsos = {}                  # nombre -> (último latido, máximo de segundos sin latir)
 _avisos = {}                  # clave -> cuándo se avisó por última vez (para no llenar el log)
+_estado_cbs = {}              # nombre -> (guardar, restaurar) registrados por los cogs de audio
+_estado_ultimo = None         # último contenido escrito en ARCHIVO_ESTADO (para no reescribir lo mismo)
+_cerrando = False             # ya se decidió reiniciar: no hay que pisar el estado guardado
 
 
 # ───────────────────────────── utilidades ─────────────────────────────
@@ -164,8 +188,11 @@ def _ultimo_reinicio() -> str:
 
 
 def _cerrar(codigo: int, motivo: str):
+    global _cerrando
     _volcar_a_archivo(motivo)
     if REINICIAR:
+        _cerrando = True                                   # deja de guardar estado: lo último guardado es lo que se restaura
+        _marcar_reinicio()
         logger.critical(f"[vigilante] cerrando el proceso (código {codigo}: {(motivo.splitlines() or ['?'])[0]}) "
                         f"para que se reinicie. Volcado en {ARCHIVO_VOLCADO}")
         _registrar_reinicio(codigo, motivo)
@@ -174,6 +201,13 @@ def _cerrar(codigo: int, motivo: str):
                 h.flush()
             except Exception:
                 pass
+        if AUTORREINICIO:
+            # vuelve a lanzar el MISMO comando en el mismo proceso (no necesita run_bot.sh ni pm2)
+            try:
+                time.sleep(1)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+            except Exception as e:
+                logger.critical(f"[vigilante] no pude relanzar el bot ({e!r}); cierro el proceso")
         os._exit(codigo)      # a propósito: un proceso congelado no puede cerrarse "bonito"
     else:
         logger.error(f"[vigilante] (código {codigo}) {(motivo.splitlines() or ['?'])[0]} — VIGILANTE_REINICIAR=0, no cierro el proceso")
@@ -191,6 +225,116 @@ def pulso(nombre: str, maximo_s: float = 300):
     """Las tareas de fondo importantes (radio, moderación...) llaman esto de vez en cuando. Si dejan de llamarlo más de
     `maximo_s` segundos, el vigilante lo avisa en el log (no reinicia). Seguro de llamar desde cualquier hilo."""
     _pulsos[nombre] = (time.monotonic(), float(maximo_s))
+
+
+# ───────────────────────────── estado del audio (para reanudar tras un reinicio) ─────────────────────────────
+
+def registrar_estado(nombre: str, guardar, restaurar=None):
+    """Registra un cog de audio. `guardar()` -> dict|None (síncrona, rápida). `restaurar(datos)` -> async (o normal).
+    Registrar de nuevo con el mismo nombre reemplaza el anterior (sirve al recargar un cog)."""
+    _estado_cbs[nombre] = (guardar, restaurar)
+
+
+def quitar_estado(nombre: str):
+    _estado_cbs.pop(nombre, None)
+
+
+def _leer_estado() -> dict:
+    try:
+        with open(ARCHIVO_ESTADO, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _escribir_estado(d: dict):
+    tmp = ARCHIVO_ESTADO + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:           # atómico: si el proceso muere a medias no queda un JSON roto
+        json.dump(d, f, ensure_ascii=False, default=str)
+        f.flush()
+    os.replace(tmp, ARCHIVO_ESTADO)
+
+
+def _marcar_reinicio():
+    """Antes de cerrar: anota en el archivo de estado que el reinicio lo provocó el vigilante (así el arranque sabe que
+    debe restaurar el audio; un reinicio manual no tiene la marca y no restaura nada)."""
+    if RESTAURAR_MAX_S <= 0:
+        return
+    try:
+        d = _leer_estado()
+        if not d.get("cogs"):
+            return                                         # no había nada sonando
+        d["reinicio"] = time.time()
+        _escribir_estado(d)
+    except Exception as e:
+        logger.error(f"[vigilante] no pude marcar el reinicio para restaurar el audio: {e!r}")
+
+
+async def _guardar_estado_periodico():
+    """Cada ESTADO_PERIODO_S segundos le pregunta a cada cog qué está sonando y lo guarda en disco. Se guarda ANTES de que
+    ocurra la falla, porque cuando el bot está congelado ya no se puede preguntar nada."""
+    global _estado_ultimo
+    while True:
+        try:
+            if not _cerrando and _estado_cbs:
+                cogs = {}
+                for nombre, (guardar, _) in list(_estado_cbs.items()):
+                    try:
+                        datos = guardar()
+                        if datos:
+                            cogs[nombre] = datos
+                    except Exception as e:
+                        logger.debug(f"[vigilante] «{nombre}» no pudo describir su estado: {e!r}")
+                contenido = json.dumps(cogs, ensure_ascii=False, sort_keys=True, default=str)
+                if contenido != _estado_ultimo:
+                    _escribir_estado({"t": time.time(), "cogs": json.loads(contenido)})
+                    _estado_ultimo = contenido
+        except Exception as e:
+            logger.debug(f"[vigilante] error guardando el estado del audio: {e!r}")
+        await asyncio.sleep(ESTADO_PERIODO_S)
+
+
+async def _restaurar(bot, previo: dict):
+    """Tras un reinicio del vigilante: espera a que el bot esté listo y le pide a cada cog que reanude lo que sonaba."""
+    cogs = previo.get("cogs") or {}
+    for _ in range(15):                                    # los cogs pueden registrarse un poco después de on_ready
+        if all(n in _estado_cbs for n in cogs):
+            break
+        await asyncio.sleep(2)
+    await asyncio.sleep(3)                                 # margen: que Discord termine de cerrar la sesión de voz vieja
+    for nombre, datos in cogs.items():
+        cb = _estado_cbs.get(nombre)
+        if not cb or cb[1] is None:
+            logger.warning(f"[vigilante] «{nombre}» tenía audio pero no registró cómo restaurarlo")
+            continue
+        for intento in range(1, 5):
+            try:
+                r = cb[1](datos)
+                if inspect.isawaitable(r):
+                    await r
+                logger.info(f"[vigilante] audio de «{nombre}» restaurado tras el reinicio")
+                break
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[vigilante] restaurar «{nombre}» falló (intento {intento}/4): {type(e).__name__}: {e}")
+                await asyncio.sleep(3 * intento)
+
+
+async def _estado_y_restauracion(bot, previo):
+    """Primero restaura (si toca) y SOLO DESPUÉS empieza a guardar: si no, el estado vacío del arranque pisaría lo que
+    hay que restaurar."""
+    try:
+        await bot.wait_until_ready()
+        if previo:
+            logger.info(f"[vigilante] restaurando el audio de: {', '.join(previo.get('cogs', {}))}")
+            await _restaurar(bot, previo)
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.warning(f"[vigilante] error restaurando el audio: {e!r}")
+    await _guardar_estado_periodico()
 
 
 async def _on_socket_event_type(_evento):
@@ -475,6 +619,12 @@ async def iniciar(bot=None):
         loop.add_signal_handler(signal.SIGUSR2, lambda: _volcar_a_archivo("volcado manual (SIGUSR2)"))
     except Exception:
         pass
+    if bot is not None:
+        previo = _leer_estado()
+        if not (RESTAURAR_MAX_S > 0 and previo.get("cogs") and previo.get("reinicio")
+                and time.time() - previo["reinicio"] <= RESTAURAR_MAX_S):
+            previo = None                                  # no fue un reinicio del vigilante (o es muy viejo): no restaurar
+        _tareas.append(asyncio.ensure_future(_estado_y_restauracion(bot, previo)))
     threading.Thread(target=_vigilar, name="vigilante", daemon=True).start()
 
     logger.info(f"[vigilante] activo: aviso a {AVISO_S:.0f}s, reinicio a {LIMITE_S:.0f}s, discord {GATEWAY_S:.0f}s, "
