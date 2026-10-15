@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 venv/
 *.log
+server_profiles/
+database/
+a.out
