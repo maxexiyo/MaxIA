@@ -1,0 +1,16 @@
+vosk_model/
+.env
+*.db
+*.sqlite
+oauth.json
+browser.json
+cookies*.txt
+ignored_channels.txt
+*.txt
+__pycache__/
+*.pyc
+venv/
+*.log
+server_profiles/
+database/
+a.out
